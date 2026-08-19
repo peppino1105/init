@@ -1,0 +1,10 @@
+/target
+*.exe
+.DS_Store
+*.log
+ok_serials.txt
+nok_serials.txt
+nok_serials_*.txt
+ok_serials._*.txt
+licence.lic
+/snapshots/
