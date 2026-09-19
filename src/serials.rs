@@ -7,41 +7,79 @@ pub fn parse_serials_file(path: &str) -> Result<Vec<String>, String> {
     parse_serials_content(&content, path)
 }
 
-pub fn parse_serials_content(content: &str, path: &str) -> Result<Vec<String>, String> {
+/// Parsed device list from an input source.
+///
+/// `serials` are the device serials (domains) in order. When the source was a
+/// SmartPSS XML, `names` holds the original `name` attribute per serial (used to
+/// keep the display name identical in the generated output XML). For plain-text
+/// sources `names` is empty.
+#[derive(Debug, Default)]
+pub struct ParsedSerials {
+    pub serials: Vec<String>,
+    pub names: Vec<String>,
+}
+
+/// Like `parse_serials_file` but also returns the SmartPSS `name` attribute per
+/// serial when the input is an XML file (empty for plain-text input).
+pub fn parse_serials_file_with_names(path: &str) -> Result<ParsedSerials, String> {
+    let content = fs::read_to_string(path).map_err(|e| format!("{}", e))?;
+    parse_serials_content_with_names(&content, path)
+}
+
+pub fn parse_serials_content_with_names(
+    content: &str,
+    path: &str,
+) -> Result<ParsedSerials, String> {
     let trimmed = content.trim_start();
     if trimmed.starts_with("<?xml")
         || trimmed.starts_with('<')
         || path.to_lowercase().ends_with(".xml")
     {
-        parse_smartpss_xml(content)
+        parse_smartpss_xml_with_names(content)
     } else {
-        Ok(content
+        let serials: Vec<String> = content
             .lines()
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .collect())
+            .collect();
+        Ok(ParsedSerials {
+            serials,
+            names: Vec::new(),
+        })
     }
 }
 
-fn parse_smartpss_xml(content: &str) -> Result<Vec<String>, String> {
+pub fn parse_serials_content(content: &str, path: &str) -> Result<Vec<String>, String> {
+    parse_serials_content_with_names(content, path).map(|p| p.serials)
+}
+
+fn parse_smartpss_xml_with_names(content: &str) -> Result<ParsedSerials, String> {
     let parser = EventReader::from_str(content);
     let mut serials = Vec::new();
+    let mut names = Vec::new();
     for event in parser {
         match event {
-            Ok(XmlEvent::StartElement { name, attributes, .. }) => {
+            Ok(XmlEvent::StartElement {
+                name, attributes, ..
+            }) => {
                 if name.local_name == "Device" {
                     let connect = attributes
                         .iter()
                         .find(|a| a.name.local_name == "connect")
                         .map(|a| a.value.trim());
                     if connect == Some("19") {
-                        if let Some(domain) = attributes
-                            .iter()
-                            .find(|a| a.name.local_name == "domain")
+                        if let Some(domain) =
+                            attributes.iter().find(|a| a.name.local_name == "domain")
                         {
                             let d = domain.value.trim();
                             if !d.is_empty() {
                                 serials.push(d.to_string());
+                                let nm = attributes
+                                    .iter()
+                                    .find(|a| a.name.local_name == "name")
+                                    .map(|a| a.value.trim().to_string())
+                                    .unwrap_or_default();
+                                names.push(nm);
                             }
                         }
                     }
@@ -51,12 +89,12 @@ fn parse_smartpss_xml(content: &str) -> Result<Vec<String>, String> {
             Err(e) => return Err(format!("XML parse error: {}", e)),
         }
     }
-    Ok(serials)
+    Ok(ParsedSerials { serials, names })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_serials_content;
+    use super::{parse_serials_content, parse_serials_content_with_names};
 
     const XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <DeviceManager version="1.0">
@@ -72,10 +110,7 @@ mod tests {
     #[test]
     fn parses_domains_with_connect_19() {
         let serials = parse_serials_content(XML, "devices.xml").unwrap();
-        assert_eq!(
-            serials,
-            vec!["7H09D4DPAZ7495F", "2K02033PAE00089"]
-        );
+        assert_eq!(serials, vec!["7H09D4DPAZ7495F", "2K02033PAE00089"]);
     }
 
     #[test]
@@ -90,5 +125,15 @@ mod tests {
     fn errors_on_xml_extension_with_non_xml_content() {
         let res = parse_serials_content("not xml at all", "devices.xml");
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn extracts_original_names_from_xml() {
+        let parsed = parse_serials_content_with_names(XML, "devices.xml").unwrap();
+        assert_eq!(parsed.serials, vec!["7H09D4DPAZ7495F", "2K02033PAE00089"]);
+        assert_eq!(
+            parsed.names,
+            vec!["01) 7H09D4DPAZ7495F", "02) 2K02033PAE00089"]
+        );
     }
 }

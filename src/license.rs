@@ -296,13 +296,19 @@ fn primary_mac() -> Option<String> {
     }
     #[cfg(target_os = "macos")]
     {
-        let out = std::process::Command::new("ifconfig").arg("-l").output().ok()?;
+        let out = std::process::Command::new("ifconfig")
+            .arg("-l")
+            .output()
+            .ok()?;
         let list = String::from_utf8_lossy(&out.stdout);
         for iface in list.split_whitespace() {
             if !(iface.starts_with("en") || iface.starts_with("eth")) {
                 continue;
             }
-            let o = std::process::Command::new("ifconfig").arg(iface).output().ok()?;
+            let o = std::process::Command::new("ifconfig")
+                .arg(iface)
+                .output()
+                .ok()?;
             let txt = String::from_utf8_lossy(&o.stdout);
             if let Some(line) = txt.lines().find(|l| l.contains("ether")) {
                 let mac = line.split_whitespace().nth(1)?.to_string();

@@ -5,16 +5,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use dahua_dhip_adduser::license;
-use eframe::egui;
 use chrono::Datelike;
 use chrono::Timelike;
+use dahua_dhip_adduser::license;
+use eframe::egui;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Op {
     AddUser,
     List,
     Delete,
+    Reboot,
+    CheckP2p,
 }
 
 struct GuiApp {
@@ -22,13 +24,19 @@ struct GuiApp {
     serial_file: String,
     user: String,
     delete_name: String,
+    delete_by_id: bool,
+    delete_all: bool,
     password: String,
     memo: String,
+    admin_user: String,
+    admin_pass: String,
     op: Op,
     group_admin: bool,
     ok_file: String,
     nok_file: String,
     verbose: bool,
+    try_defaults: bool,
+    snapshot: bool,
     log: Arc<Mutex<String>>,
     running: Arc<AtomicBool>,
     child: Arc<Mutex<Option<std::process::Child>>>,
@@ -51,28 +59,34 @@ impl GuiApp {
         let machine_id = license::machine_id();
         let (licensed, license_reason) = match license::check_license() {
             license::LicenseStatus::Valid => (true, String::new()),
-            license::LicenseStatus::Missing => {
-                (false, "licence.lic not found: activate the license to continue.".into())
-            }
-            license::LicenseStatus::Empty => {
-                (false, "licence.lic is empty: activate the license to continue.".into())
-            }
-            license::LicenseStatus::Invalid(r) => {
-                (false, format!("Invalid license file: {}.", r))
-            }
+            license::LicenseStatus::Missing => (
+                false,
+                "licence.lic not found: activate the license to continue.".into(),
+            ),
+            license::LicenseStatus::Empty => (
+                false,
+                "licence.lic is empty: activate the license to continue.".into(),
+            ),
+            license::LicenseStatus::Invalid(r) => (false, format!("Invalid license file: {}.", r)),
         };
         Self {
             serial: String::new(),
             serial_file: String::new(),
             user: String::new(),
             delete_name: String::new(),
+            delete_by_id: false,
+            delete_all: false,
             password: String::new(),
             memo: String::new(),
+            admin_user: String::new(),
+            admin_pass: String::new(),
             op: Op::AddUser,
             group_admin: true,
             ok_file: "ok_serials.txt".into(),
             nok_file: "nok_serials.txt".into(),
             verbose: false,
+            try_defaults: false,
+            snapshot: false,
             log: Arc::new(Mutex::new(String::new())),
             running: Arc::new(AtomicBool::new(false)),
             child: Arc::new(Mutex::new(None)),
@@ -99,7 +113,10 @@ impl GuiApp {
     fn browse(&mut self) {
         if let Some(path) = rfd::FileDialog::new().pick_file() {
             self.serial_file = path.to_string_lossy().to_string();
-            self.log_line(&format!("[GUI] Serials file selected: {}", self.serial_file));
+            self.log_line(&format!(
+                "[GUI] Serials file selected: {}",
+                self.serial_file
+            ));
         }
     }
 
@@ -107,10 +124,7 @@ impl GuiApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Dahua P2P — License required");
             ui.add_space(8.0);
-            ui.colored_label(
-                egui::Color32::from_rgb(200, 60, 60),
-                &self.license_reason,
-            );
+            ui.colored_label(egui::Color32::from_rgb(200, 60, 60), &self.license_reason);
             ui.add_space(12.0);
             ui.label(
                 "This computer is not enabled. To get a license, send this machine \
@@ -154,8 +168,7 @@ impl GuiApp {
                                     self.status = "License saved".into();
                                 }
                                 Err(e) => {
-                                    self.license_msg =
-                                        format!("Error writing licence.lic: {}", e)
+                                    self.license_msg = format!("Error writing licence.lic: {}", e)
                                 }
                             },
                             Err(reason) => {
@@ -184,9 +197,19 @@ impl GuiApp {
             .collect();
 
         let serial_file = self.serial_file.trim().to_string();
+        // Nomi originali SmartPSS (serial -> name) quando l'input è un file XML.
+        let mut original_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         let (raw, use_file): (Vec<String>, bool) = if !serial_file.is_empty() {
-            match dahua_dhip_adduser::serials::parse_serials_file(&serial_file) {
-                Ok(list) => (list, true),
+            match dahua_dhip_adduser::serials::parse_serials_file_with_names(&serial_file) {
+                Ok(p) => {
+                    for (serial, nm) in p.serials.iter().zip(p.names.iter()) {
+                        if !nm.is_empty() {
+                            original_names.insert(serial.clone(), nm.clone());
+                        }
+                    }
+                    (p.serials, true)
+                }
                 Err(e) => {
                     self.log_line(&format!(
                         "[GUI] ERROR reading serials file '{}': {}",
@@ -224,11 +247,28 @@ impl GuiApp {
             }
             Op::List => {}
             Op::Delete => {
-                if delete_name.is_empty() {
-                    self.log_line("[GUI] ERROR: for delete, write the username to delete");
-                    return;
+                if !self.delete_all {
+                    if delete_name.is_empty() {
+                        self.log_line(
+                            "[GUI] ERROR: for delete, write the username (or numeric Id) to delete",
+                        );
+                        return;
+                    }
+                    if self.delete_by_id && delete_name.parse::<u32>().is_err() {
+                        self.log_line("[GUI] ERROR: delete by Id requires a numeric Id");
+                        return;
+                    }
                 }
             }
+            Op::Reboot => {}
+            Op::CheckP2p => {}
+        }
+
+        if self.snapshot && (user.is_empty() || password.is_empty()) {
+            self.log_line(
+                "[GUI] ERROR: snapshot requires user and password (camera stream credentials)",
+            );
+            return;
         }
 
         let cli = cli_binary_path();
@@ -243,6 +283,18 @@ impl GuiApp {
         let mut args: Vec<String> = vec!["--relay".into()];
         if self.verbose {
             args.push("-v".into());
+        }
+        if self.try_defaults {
+            args.push("--try-defaults".into());
+        }
+        let admin_user = self.admin_user.trim().to_string();
+        if !admin_user.is_empty() {
+            args.push("--admin-user".into());
+            args.push(admin_user);
+        }
+        if !self.admin_pass.is_empty() {
+            args.push("-p".into());
+            args.push(self.admin_pass.clone());
         }
 
         match self.op {
@@ -259,21 +311,48 @@ impl GuiApp {
                     args.push("--group".into());
                     args.push("user".into());
                 }
+                if self.snapshot {
+                    args.push("--snapshot".into());
+                }
             }
             Op::List => {
                 args.push("--list-users".into());
             }
             Op::Delete => {
-                args.push("--delete-user-name".into());
-                args.push(delete_name);
+                if self.delete_all {
+                    args.push("--delete-all".into());
+                } else if self.delete_by_id {
+                    args.push("--delete-user".into());
+                    args.push(delete_name);
+                } else {
+                    args.push("--delete-user-name".into());
+                    args.push(delete_name);
+                }
+            }
+            Op::Reboot => {
+                args.push("--reboot".into());
+            }
+            Op::CheckP2p => {
+                args.push("--check-p2p".into());
+                if self.snapshot {
+                    args.push("--snapshot".into());
+                    args.push("-u".into());
+                    args.push(user.clone());
+                    args.push("-w".into());
+                    args.push(password.clone());
+                }
             }
         }
 
-        if matches!(self.op, Op::AddUser | Op::Delete) {
+        if matches!(self.op, Op::AddUser | Op::Delete | Op::Reboot) {
             args.push("--ok-file".into());
             args.push(self.ok_file.clone());
             args.push("--nok-file".into());
             args.push(self.nok_file.clone());
+        }
+
+        if !self.generate_smartpss {
+            args.push("--no-xml".into());
         }
 
         let serials_source = if use_file {
@@ -293,7 +372,15 @@ impl GuiApp {
             serials_source.clone()
         } else {
             let now: chrono::DateTime<chrono::Local> = chrono::Local::now();
-            format!("{:04}{:02}{:02}-{:02}{:02}{:02}", now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second())
+            format!(
+                "{:04}{:02}{:02}-{:02}{:02}{:02}",
+                now.year(),
+                now.month(),
+                now.day(),
+                now.hour(),
+                now.minute(),
+                now.second()
+            )
         };
 
         self.log_line(&format!(
@@ -369,7 +456,9 @@ impl GuiApp {
             let status = child_slot.lock().unwrap().as_mut().map(|c| c.wait());
             if let Ok(mut l) = log.lock() {
                 match status {
-                    Some(Ok(s)) => l.push_str(&format!("\n[GUI] Process finished (exit {:?})\n", s.code())),
+                    Some(Ok(s)) => {
+                        l.push_str(&format!("\n[GUI] Process finished (exit {:?})\n", s.code()))
+                    }
                     _ => l.push_str("\n[GUI] Process finished\n"),
                 }
             }
@@ -394,6 +483,7 @@ impl GuiApp {
                         &user,
                         &password,
                         &countries,
+                        &original_names,
                     ) {
                         Ok(()) => {
                             if let Ok(mut l) = log.lock() {
@@ -454,7 +544,10 @@ fn parse_progress(s: &str) -> (usize, usize, usize, usize) {
                 if let Some(bracket) = rest.find(']') {
                     if bracket > slash {
                         let num = rest[..slash].trim().parse::<usize>().unwrap_or(0);
-                        let den = rest[slash + 1..bracket].trim().parse::<usize>().unwrap_or(0);
+                        let den = rest[slash + 1..bracket]
+                            .trim()
+                            .parse::<usize>()
+                            .unwrap_or(0);
                         if num >= 1 && num <= den && den > 0 {
                             processed = num;
                             total = den;
@@ -503,20 +596,23 @@ fn generate_smartpss_file(
     user: &str,
     password: &str,
     countries: &std::collections::HashMap<String, String>,
+    original_names: &std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
     use base64::Engine;
 
-    let mut xml = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n",
-    );
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n");
     xml.push_str("<DeviceManager version=\"1.0\">\n");
     for (i, serial) in serials.iter().enumerate() {
-        let name = match countries.get(serial) {
-            Some(c) => format!("{:02}_{}_{}", i + 1, c, serial),
-            None => format!("{:02}_{}", i + 1, serial),
+        // Preserva il `name` dell'XML SmartPSS di origine quando disponibile,
+        // altrimenti genera un name progressivo con la country (come prima).
+        let name = match original_names.get(serial) {
+            Some(n) if !n.is_empty() => n.clone(),
+            _ => match countries.get(serial) {
+                Some(c) => format!("{:02}_{}_{}", i + 1, c, serial),
+                None => format!("{:02}_{}", i + 1, serial),
+            },
         };
-        let b64 =
-            base64::engine::general_purpose::STANDARD.encode(password.as_bytes());
+        let b64 = base64::engine::general_purpose::STANDARD.encode(password.as_bytes());
         xml.push_str(&format!(
             "\n<Device connect=\"19\" domain=\"{}\" name=\"{}\" password=\"{}\" port=\"37777\" protocol=\"1\" username=\"{}\"/>",
             xml_escape(serial),
@@ -637,8 +733,9 @@ impl eframe::App for GuiApp {
             ui.horizontal(|ui| {
                 ui.label("Serial number:");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.serial)
-                        .hint_text("e.g. 6M06DDXXXXXXXX (multiple serials separated by space/comma)"),
+                    egui::TextEdit::singleline(&mut self.serial).hint_text(
+                        "e.g. 6M06DDXXXXXXXX (multiple serials separated by space/comma)",
+                    ),
                 );
                 ui.label("Group:");
                 ui.radio_value(&mut self.group_admin, true, "admin (all permissions)");
@@ -660,6 +757,20 @@ impl eframe::App for GuiApp {
                 ui.checkbox(&mut self.generate_smartpss, "Generate SmartPSS file");
             });
 
+            ui.horizontal(|ui| {
+                ui.label("Admin user:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.admin_user)
+                        .hint_text("device admin (default: admin)"),
+                );
+                ui.label("Admin pass:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.admin_pass)
+                        .password(true)
+                        .hint_text("device admin password (required on hardened firmware)"),
+                );
+            });
+
             match self.op {
                 Op::AddUser => {
                     ui.horizontal(|ui| {
@@ -677,14 +788,40 @@ impl eframe::App for GuiApp {
                 }
                 Op::Delete => {
                     ui.horizontal(|ui| {
-                        ui.label("User to delete:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.delete_name)
-                                .hint_text("username to delete"),
-                        );
+                        ui.add_enabled_ui(!self.delete_all, |ui| {
+                            ui.label("User to delete:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.delete_name)
+                                    .hint_text("username to delete"),
+                            );
+                            ui.radio_value(&mut self.delete_by_id, false, "Name");
+                            ui.radio_value(&mut self.delete_by_id, true, "Id");
+                        });
+                        ui.radio_value(&mut self.delete_all, false, "single");
+                        ui.radio_value(&mut self.delete_all, true, "delete all (keep admin)");
                     });
                 }
                 Op::List => {}
+                Op::Reboot => {
+                    ui.label("Reboot each device (magicBox.reboot). No fields required.");
+                }
+                Op::CheckP2p => {
+                    ui.label("Check P2P/cloud state of each device (account, status, public IP).");
+                    if self.snapshot {
+                        ui.horizontal(|ui| {
+                            ui.label("User:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.user)
+                                    .hint_text("camera stream user"),
+                            );
+                            ui.label("Password:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.password)
+                                    .hint_text("camera stream password"),
+                            );
+                        });
+                    }
+                }
             }
 
             ui.horizontal(|ui| {
@@ -692,6 +829,21 @@ impl eframe::App for GuiApp {
                 ui.radio_value(&mut self.op, Op::AddUser, "add_user");
                 ui.radio_value(&mut self.op, Op::List, "list");
                 ui.radio_value(&mut self.op, Op::Delete, "delete");
+                ui.radio_value(&mut self.op, Op::Reboot, "reboot");
+                ui.radio_value(&mut self.op, Op::CheckP2p, "check_p2p");
+            });
+
+            ui.horizontal(|ui| {
+                let can_snapshot = matches!(self.op, Op::AddUser | Op::CheckP2p);
+                ui.add_enabled(
+                    can_snapshot,
+                    egui::Checkbox::new(&mut self.snapshot, "Snapshot"),
+                );
+                if can_snapshot {
+                    ui.label("(capture a live JPG per active camera channel)");
+                } else {
+                    ui.label("(only with add_user or check_p2p)");
+                }
             });
 
             ui.horizontal(|ui| {
@@ -700,6 +852,7 @@ impl eframe::App for GuiApp {
                 ui.label("NOK file:");
                 ui.add(egui::TextEdit::singleline(&mut self.nok_file));
                 ui.checkbox(&mut self.verbose, "Verbose");
+                ui.checkbox(&mut self.try_defaults, "Try default passwords");
             });
 
             if self.op == Op::AddUser {
@@ -737,13 +890,11 @@ impl eframe::App for GuiApp {
                 ui.label(&self.status);
                 let (processed, total, ok, nok) = self.progress();
                 if total > 0 {
-                    let counter = format!(
-                        "    [{}/{}]  OK: {}  NOK: {}",
-                        processed, total, ok, nok
-                    );
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(counter).monospace().strong()),
-                    );
+                    let counter =
+                        format!("    [{}/{}]  OK: {}  NOK: {}", processed, total, ok, nok);
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(counter).monospace().strong(),
+                    ));
                 }
             });
 
@@ -790,8 +941,7 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::{
-        generate_smartpss_file, load_ok_entries, parse_progress,
-        parse_serial_entry, smartpss_paths,
+        generate_smartpss_file, load_ok_entries, parse_progress, parse_serial_entry, smartpss_paths,
     };
 
     #[test]
@@ -858,28 +1008,26 @@ mod tests {
         use base64::Engine;
 
         let path = std::env::temp_dir().join("dahua_smartpss_test.xml");
-        let serials = vec![
-            "7H09D4DPAZ7495F".to_string(),
-            "2K02033PAE00089".to_string(),
-        ];
+        let serials = vec!["7H09D4DPAZ7495F".to_string(), "2K02033PAE00089".to_string()];
         let mut countries = std::collections::HashMap::new();
         countries.insert("7H09D4DPAZ7495F".to_string(), "IT".to_string());
+        let empty_names = std::collections::HashMap::new();
         let res = generate_smartpss_file(
             path.to_str().unwrap(),
             &serials,
             "camuser02251",
             "Cam@2026",
             &countries,
+            &empty_names,
         );
         assert!(res.is_ok());
         let content = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
-        let b64 = base64::engine::general_purpose::STANDARD
-            .encode("Cam@2026".as_bytes());
-        assert!(content.starts_with(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n"
-        ));
+        let b64 = base64::engine::general_purpose::STANDARD.encode("Cam@2026".as_bytes());
+        assert!(
+            content.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n")
+        );
         assert!(content.contains("<DeviceManager version=\"1.0\">"));
         assert!(content.contains(
             "<Device connect=\"19\" domain=\"7H09D4DPAZ7495F\" name=\"01_IT_7H09D4DPAZ7495F\""
@@ -892,6 +1040,30 @@ mod tests {
             b64
         )));
         assert!(content.contains("</DeviceManager>"));
+
+        // Con i nomi originali SmartPSS (da XML di input) il `name` resta invariato.
+        let mut names = std::collections::HashMap::new();
+        names.insert(
+            "7H09D4DPAZ7495F".to_string(),
+            "01) 7H09D4DPAZ7495F".to_string(),
+        );
+        let res2 = generate_smartpss_file(
+            path.to_str().unwrap(),
+            &serials,
+            "camuser02251",
+            "Cam@2026",
+            &countries,
+            &names,
+        );
+        assert!(res2.is_ok());
+        let content2 = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(content2.contains(
+            "<Device connect=\"19\" domain=\"7H09D4DPAZ7495F\" name=\"01) 7H09D4DPAZ7495F\""
+        ));
+        assert!(content2.contains(
+            "<Device connect=\"19\" domain=\"2K02033PAE00089\" name=\"02_2K02033PAE00089\""
+        ));
     }
 
     #[test]

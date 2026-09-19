@@ -37,6 +37,13 @@ cargo run -f serials.txt --relay -u <user> -w <pass> --http -P 80
 cargo run --serial <SERIAL> --relay --list-users
 cargo run --serial <SERIAL> --relay --delete-user <Id>
 cargo run --serial <SERIAL> --relay --delete-user-name <Name>
+cargo run --serial <SERIAL> --relay --delete-all
+cargo run --serial <SERIAL> --relay --reboot
+cargo run -f serials.txt --relay --reboot
+cargo run --serial <SERIAL> --relay --check-p2p
+cargo run -f serials.txt --relay --check-p2p
+cargo run --serial <SERIAL> --relay -u <user> -w <pass> --snapshot
+cargo run -f serials.txt --relay -u <user> -w <pass> --snapshot
 cargo run --serial <SERIAL> --relay -u <user> -w <pass> --group user
 cargo run --serial <SERIAL> --relay --dump-account
 ```
@@ -48,20 +55,42 @@ cargo run --serial <SERIAL> --relay --dump-account
   (campo `device_public_ip` in `HandshakeResult`).
 - `src/geo.rs` risolve IP → paese/città via ip-api.com (HTTP, free, ~45 req/min). Se il lookup
   fallisce/timeout la riga usa `XX`/`N/A`. Nomi città in inglese (tier free; `lang` non applicato).
+  `GeoInfo` contiene `country_code`, `country` (nome paese) e `city`.
 - Il lookup viene eseguito solo al successo dell'add, per ogni cam.
+
+### Input XML SmartPSS → preservazione del `name` nel file generato
+- Quando l'input dei seriali è un **file XML formato SmartPSS** (`<Device ... domain="SERIAL" name="...">`),
+  il parser (`src/serials.rs`) estrae sia i seriali (`domain`) sia l'attributo `name` di ogni device.
+- `parse_serials_file_with_names` / `parse_serials_content_with_names` restituiscono
+  `ParsedSerials { serials, names }`; `parse_serials_file` / `parse_serials_content` restano come
+  prima (solo `serials`) per compatibilità.
+- Nel file XML **generato** dei seriali OK (CLI `generate_smartpss_from_ok`, GUI `generate_smartpss_file`),
+  l'attributo `name` viene **copiato dall'XML di origine** quando disponibile (map serial→name);
+  in assenza di XML d'origine si genera un name progressivo come prima (`{:02}_{}` / `{:02}_{country}_{}`).
+- Nota: `username`/`password` nel file generato restano quelli del **nuovo** utente creato (`--user`/`--password`);
+  solo il campo display `name` viene mantenuto identico all'origine.
 
 - `--http` is effectively legacy; both modes now use HTTP/RPC2 for addUser
 - `-P` sets the PTCP bind port (default 5000)
-- `--list-users` shows users as `Id<TAB>Name<TAB>Group<TAB>Password` (same format as `--dump-account`; the `Id` is the real numeric `"Id"` field, admin = 2)
+- `--list-users` shows users as `Id<TAB>Name<TAB>Group<TAB>Password` (same format as `--dump-account`; the `Id` is the real numeric `"Id"` field, admin = 2). **Now uses `dhip_established_session`** so `--list-users --try-defaults` works on old Digest firmware (previously `dhip_list_users` had its own login logic that didn't support try-defaults).
 - `--delete-user <Id>` deletes by the numeric `"Id"` from the user list, resolved to a Name first
+- **Fail-fast delete su Id inesistente** (`6B003ACPAZ64EDE`): se `getUserInfoAll` elenca gli utenti ma l'Id richiesto NON compare (es. Id 10 assente mentre il device ha decine di utenti), sia nel ramo DHIP sia in quello HTTP il tool abortisce SUBITO con `user Id=N not found ... (user list queried ok)` invece di esaurire ~13 varianti `deleteUser` con `{"name":null}` (tutte rifiutate con `268894211 "Request invalid param!"`) e i metodi alternativi `accountManager.deleteAccount`/`userManager.deleteUsers` (`268894210 "Method not found!"` su fw 5.2.1). Implementato: `http_find_user_object`/`http_find_user_object_by_name` ora ritornano `(Option<Value>, bool)` con bool = lista letta ok; `dhip_try_delete_user` traccia `found_in_list`.
 - `--delete-user-name <Name>` deletes directly by username (no need to know the Id)
+- `--reboot` riavvia ogni dispositivo sul canale DHIP della sessione stabilità (handshake → challenge → login → reboot). **Il reboot prova più varianti in sequenza** perché `magicBox.reboot` con `params: {}` su alcuni firmware (es. `3K02366PAZ523DA`) fa un power-off che NON si completa (la cam resta spenta): ordine provato → `magicBox.reboot {"mode":0}` → `magicBox.reboot {}` → `magicBox.reboot {"mode":1}` → `magicBox.restart {}` → `system.reboot {}`; la prima che risponde `result:true` vince. Se il device si riavvia subito e chiude il canale senza rispondere, il tool lo considera inviato. In GUI l'operazione "reboot" è un radio button senza campi richiesti; usa `--admin-pass`/`--try-defaults` quando il device richiede credenziali reali.
+- `--check-p2p` diagnostica lo **stato P2P/cloud** di ogni dispositivo (utile quando SmartPSS risulta offline ma il tool via P2P ci arriva). Flusso: handshake → challenge → sessione → `configManager.getConfig` su più tabelle (`P2P`, `Network`, `_Cloud`, `System`, …) e stampa i campi rilevanti per il cloud (Account/User, Status/Regist/Online/State, UID, Server, Address), più l'IP pubblico del device riportato dal relay. **Ultima riga**: IP pubblico della cam + geolocalizzazione (`Public IP`, `Country` nome+codice, `City`) risolta via `geo::lookup`. La diagnosi tipica: `3K02366PAZ523DA` ha **account P2P vuoto**, quindi il tool (tunnel P2P anonimo per UID) ci arriva, ma SmartPSS in modalità direct/IP non riesce (TCP diretto a IP dietro NAT) e in modalità cloud resta offline. In GUI l'operazione "check_p2p" è un radio button senza campi richiesti.
+- `--snapshot` cattura uno **snapshot JPG live di ogni canale camera attivo** del device, per verificare che le cam inquadrino correttamente. Flusso: handshake → challenge → sessione → `configManager.getConfig` su `ChannelTitle`/`VideoInChannels`/`Camera` per **scoprire i canali attivi** (fallback: probe progressivo 1..=16 se nessuna tabella espone il conteggio) → per ogni canale `GET /cgi-bin/snapshot.cgi?channel=N&user=..&password=..` via `http_get_binary` (tunnel P2P) su porta 80 (fallback 5000). Usa `--user`/`--password` come **credenziali del flusso video** (query string), NIENTE riuso dell'admin. Valida i magic bytes JPEG (`FF D8 FF`) e salva ogni immagine in `snapshots/<serial>_ch<N>.jpg`; se un canale non restituisce JPEG lo segnala e prosegue sugli altri. Il report finale è FAIL solo se nessun canale produce immagini. RTSP/porta 37777 NON è supportato (flusso video di natura diversa, non passa nel tunnel PTCP). In CLI `--snapshot` si **combina** con add_user o `--check-p2p` (dopo l'operazione principale; le early return di list/delete/reboot lo ignorano), MAI da solo. **Log snapshot in errore**: a fine batch viene scritto `yyyyddmmhhMM.log` (anno-giorno-mese-ora-minuto locale, es. `202618091430.log`) nella cwd, con un seriale per riga per ogni device la cui acquisizione è fallita.
 - `--group <admin|user>` (default `admin`): `admin` = all permissions (full AuthorityList, Type tried Normal/Admin/Operator); `user` = `Group: "user"`, Type `Normal`, AuthorityList filtered to only `Monitor*`/`Replay*` entries (monitor+playback on every channel)
 - `--dump-account` prints one line per user as `Id<TAB>Name<TAB>Group<TAB>Password` (from `configManager.getConfig name="Account"`). On firmware 2021+ the `Password` column is `null` (never plaintext); the plaintext is **not** recoverable via the cloud API on such devices.
-- The P2P handshake is retried up to **3 times** (3s sleep between attempts) before a serial is marked FAIL — some devices/relays intermittently drop the first attempt (`Timeout waiting for PTCP Sync from agent`).
+- The P2P handshake is retried up to **3 times** (3s sleep between attempts) before a serial is marked FAIL — some devices/relays intermittently drop the first attempt (`Timeout waiting for PTCP Sync from agent`). I pacchetti PTCP troncati/malformati non causano più panik (`short_malformed_packets_do_not_panic`); gli errori di send (`HostUnreachable`/`No route to host`) sono gestiti da `dh_request` → `Result<(), String>` e propagati senza crashare il batch.
 - When `--admin-pass` is given, `--list-users`/`--dump-account`/`add_user`/`delete` try a real authenticated login first and only fall back to the bypass on failure. `Password` stays `null` either way on firmware 2021+.
 - Duplicate detection: if all `userManager.addUser` variants fail, the tool does NOT guess "already exists" from the error code (that produced false positives — e.g. `prova_verifica`, a brand-new name, failed with the same 268632079 code as a real duplicate on `2C0359FPAE00017`). It confirms via `getUserInfoAll` (`dhip_user_exists`/`http_user_exists`): only a confirmed existing user reports `[!] user 'X' already exists on device, skipping` as OK; otherwise it's a real FAIL.
 - DHIP bypass login tries `authorityType: "Admin"` combos first (`Local/Loopback`, `InetWeb/Network`, `Web/Direct`), falling back to `Default`. Works fine on cameras where addUser succeeds (verified on `2K02033PAE00089`, add succeeds on first `Type=Admin` variant).
 - **Hardened firmware** (`2C0359FPAE00017`): the bypass session can READ users (`getUserInfoAll`) but `addUser` is always rejected with `268632079 "Component error: login challenge!"` for every username/Type/authorityType — account management requires a genuinely authenticated session. `--admin-pass` is mandatory on such devices; without it the tool correctly reports FAIL instead of a false OK.
+- **Hardened firmware variante "silenziosa"** (`2L05BD6PAZ00030`): stesso tipo di restrizione ma il dispositivo NON risponde affatto agli addUser dalla sessione bypass (droppa il canale invece di dare errore) — diagnosticato dal messaggio `device never answered any addUser`. Contromisure implementate: `--try-defaults` (prova le password di fabbrica documentate — `admin`, `123456`, `888888`, `54321`, `admin123`, `12345` — con login REALE prima del bypass, in GUI checkbox "Try default passwords"), payload addUser minimale (`Name/Password/Group/Type` + solo `Monitor`) per firmware che vanno in crash su campi inattesi, e `configManager.setConfig` sulla tabella Account come ultimo resort.
+- **Firmware vecchio OldDigest** (`1J034D3PAY01528`): challenge con `"encryption":"OldDigest"`, `random:""`, realm vuoto `"Login to "`; `--try-defaults` ci entra con la password di fabbrica `admin`. MA `getUserInfoAll` con `"params":"null"` (stringa, forma legacy) fa **crashare il componente**: canale morto, silenzio totale su tutto il resto (deleteUser compreso). Fix: la risoluzione Id→Nome nel delete usa ora `"params": {}` (come il flusso list, verificato) con fallback sulla forma `"null"`, logga la risposta raw in verbose, e se il dispositivo non elenca gli utenti fallisce SUBITO senza sprecare varianti deleteUser. Inoltre `delete_users`, prima del fallback HTTP, rifà un **handshake P2P completo** (i dispositivi a canale singolo non accettano re-bind sul canale vecchio/morto).
+- **Firmware vecchio OldDigest senza gestione utenti** (`2F04340PAZ00003`): challenge con `"encryption":"OldDigest"`, randsalt vuoto; `--try-defaults` fa login OK con `admin/admin` (DHIP bypass + HTTP bypass). MA il device NON risponde a NESSUN metodo di gestione utenti remota: `getUserInfoAll {}`, `getUserInfoAll "null"`, `getUserList`, `configManager.getConfig` su tutti i nomi (`Account`, `account`, `UserManager`, `Security`, `System`) → `dhip_call` ritorna None (timeout silenzioso), HTTP `RPC2` senza sessione. Il tool ora logga esplicitamente "device did not return any users" quando la lista è vuota, invece di sprecare varianti delete. Fix intermedi: `dhip_list_users` ora usa `dhip_established_session` (supporta `--try-defaults`), `http_establish_session` ora prova le default admin passwords. Il device rimane non gestibile per delete/list — il firmware è probabilmente troppo vecchio per supportare la gestione utenti remota via DHIP/HTTP.
+- **Hardened firmware variante 2** (`3H050BEPAG00046`): bypass login HTTP riesce (sessione autenticata), ma il dispositivo invia **DISC** (disconnect) al primo RPC successivo (getUserInfoAll) e poi solo Heartbeats. Senza gestione DISC, il tool spreca ~30s × 6 tentativi inutili prima di arrendersi. Fix: `http_call` ora imposta un flag `LAST_CALL_DISC` quando riceve un DISC, e i call site (`http_list_users_on_port`, `http_delete_user`, `http_add_user`) abortono immediatamente con messaggio "device sent DISC — channel dead" invece di provare ogni metodo.
+- **Max utenti raggiunto / falso OK da `setConfig(Account)`** (`5MMF0B22PAGC067`): aggiungere un utente quando il device ha raggiunto il numero massimo di account fa fallire `userManager.addUser` con **code 615** per ogni Type, e il fallback `configManager.setConfig(Account)` ritorna `result:true` ma **NON aggiunge davvero** l'utente. Prima il tool dichiarava OK; ora, dopo il `setConfig`, fa la verifica via `getUserInfoAll`: se l'utente NON è presente il tool stampa l'avviso (probabile limite utenti raggiunto) e ritorna **FAIL** invece del falso OK. Il code 615 nel `setConfig` viene riconosciuto e segnalato come `maximal number of users reached on device`.
 
 ## GUI
 
@@ -70,8 +99,9 @@ spawns the CLI as a subprocess and streams its stdout/stderr into a log panel.
 
 - Fields: serial (one or more, space/comma separated) OR a serials file via "Sfoglia..." (button `X` to clear)
 - Group radio (right of the serial field): **admin (tutti i permessi)** or **user (monitor+playback)** → passed as `--group user` when `user` is selected
-- Operation radio: **add_user** (shows Utente+Password+Memo), **list**, **delete** (shows a dedicated "Utente da eliminare" field passed as `--delete-user-name`)
-- File OK / File NOK paths (only used by add_user/delete), Verbose checkbox, "Elabora" button
+- Operation radio: **add_user** (shows Utente+Password+Memo), **list**, **delete** (shows a dedicated "Utente da eliminare" field with radio **Name**/**Id** — Name passes `--delete-user-name`, Id passes `--delete-user` and validates the input is numeric), **reboot**, **check_p2p**
+- **Snapshot checkbox** (right below the operation radio): NOT a radio button anymore — adds `--snapshot` to the args. Only enabled with **add_user** (reuses Utente/Password) or **check_p2p** (shows Utente/Password fields inline, required as camera credentials); disabled otherwise. Not combinable with list/delete/reboot.
+- File OK / File NOK paths (only used by add_user/delete), Verbose checkbox, **"Try default passwords" checkbox** (`--try-defaults`, sempre visibile, a destra di Verbose), "Elabora" button
 - "Esci" button closes the app and kills any running subprocess
 - The GUI locates the CLI binary next to its own executable (`target/debug/dahua-dhip-adduser`)
 
@@ -79,21 +109,25 @@ spawns the CLI as a subprocess and streams its stdout/stderr into a log panel.
 
 ### Unified flow (both modes)
 1. **P2P Handshake** — connects to Dahua P2P relay, establishes P2P session
-2. **DHIP Challenge** — sends `global.login` on port 5000 to get the **DHIP numeric realm**
-3. **HTTP/RPC2 addUser** — POST /RPC2_Login (bypass) → POST /RPC2 with `MD5(user:realm:password)` using the DHIP numeric realm, no `passwordType`
-4. **PTCP Disconnect** — close the tunnel
+2. **DHIP Challenge** — sends `global.login` on port 5000 (fallback 80) to get the **realm**; the bound PTCP channel is kept OPEN
+3. **DHIP addUser on the live challenge channel** — login (real `--admin-pass` first, then bypass combos) + `userManager.addUser`, no re-bind
+4. **HTTP/RPC2 fallback** — only if DHIP failed: POST /RPC2_Login (bypass) → POST /RPC2 with `MD5(user:realm:password)` using the challenge realm, ports 80 then 5000
+5. **PTCP Disconnect** — close the tunnel
 
 Both `--http` and default mode go through this same flow. The only difference is the bind port (for potential firewall compat).
+
+**Perché l'add avviene sul canale del challenge**: alcuni dispositivi (es. `2L05BD6PAZ00030`) accettano **un solo canale PTCP alla volta** e rifiutano QUALSIASI re-bind dopo il disconnect (`PTCP bind failed on all ports`). Su questi, il challenge riusciva ma ogni tentativo successivo falliva; riusare il canale già aperto (con realm/random/session del challenge) risolve. Stesso schema per delete e per il flusso HTTP di fallback.
 
 ## Key Findings
 
 ### The password hash
-- **addUser stores `MD5(username:realm:password)` (HA1 format) with no `passwordType` field** — this is the correct format for SmartPSS compatibility
+- **addUser stores `MD5(username:realm:password)` (HA1 format)** — this is the correct format for SmartPSS compatibility
+- All addUser payloads (DHIP `userManager.addUser`, il variante minimal, e HTTP `http_add_user`) ora includono **`"passwordType": "Default"`**: senza questo campo alcuni dispositivi (es. `3K02366PAZ523DA`) aggiungono l'utente, ma SmartPSS lo rifiuta come "profile" invalido perché il record manca del campo che identifica l'hash come HA1. I fallback `configManager.setConfig(Account)` lo includevano già.
 - The **DHIP numeric realm** (e.g. `"1234567890"` from port 5000 challenge) is used for the hash, NOT the HTTP challenge realm (`"Login to ..."`)
 - SmartPSS uses the same numeric realm for its own auth hash
 
 ### P2P channel auth (firmware 2023+)
-- Some DVRs (newer firmware) refuse the anonymous P2P channel with **403**. The relay reports the error in the body:
+- Some DVRs (newer firmware) refuse the anonymous P2P channel with **403** (alcuni anche con **401**, es. `5A04076PBQCEAC5`). The relay reports the error in the body:
   - `DevPwd_InvalidSalt` = anonymous channel refused (no `<RandSalt>` sent)
   - `DevPwd_InvalidDigest` = salt accepted, wrong device credentials (or empty password)
 - The fix (implemented in `p2p.rs`): query `/info/device/{serial}` → decrypt the `<Info>` payload (AES-256-OFB with **fixed** key `kRjmsUB&ezmdGLL67H#$ojw@XflcaIaf` / IV `MydvJw*Iw1w&i^kk`) → get `randsalt`; then retry `p2p-channel` with `IpEncrptV2` + `DevAuth`:
@@ -101,6 +135,7 @@ Both `--http` and default mode go through this same flow. The only difference is
   - `LocalAddr` encrypted with AES-256-OFB (IV `2z52*lk9o6HRyJrf`) using key = PBKDF2-HMAC-SHA256(`key`, str(nonce), 20000, 32)
   - `DevAuth = base64(HMAC-SHA256(key, "{nonce}{unix_ts}{encrypted_LocalAddr}"))`
   - `relay-channel` uses the same `DevAuth` with a new nonce and empty payload
+- **Ritenta DevAuth su 401 E 403** (prima solo 403). Se `/info/device` non ha esposto il `randsalt`, il tool lo cerca nel **body dell'errore del canale** (`randsalt_from_err_body`: chiave XML `RandSalt`/`.../RandSalt`). Le password provate per il DevAuth: `--admin-pass` (se dato) poi le default passwords se `--try-defaults` (stesso `DEFAULT_ADMIN_PASSWORDS` condiviso, ora in `p2p.rs`). Se nessuna password funziona l'hint suggerisce `--admin-pass` o `--try-defaults`.
 - The user for DevAuth is the **device account** (`--admin-user`, default `admin`) and the password is `--admin-pass` (`-p`). If the device has a password set, it **must** be provided (`--admin-pass <pwd>`) or the channel stays 403.
 - Crypto verified against dh-p2p reference vectors in `p2p.rs` tests (`cargo test`).
 
@@ -109,6 +144,7 @@ Both `--http` and default mode go through this same flow. The only difference is
 - Current DHIP addUser omits `passwordType` and stores `MD5(user:realm:password)` verbatim — same result as the HTTP/RPC2 path.
 - The DHIP add flow tries HTTP/RPC2 first, then falls back to DHIP addUser when the HTTP challenge fails (error `268632079` on ports 80/5000 for some devices, e.g. `2K02033PAE00089`, `2C0359FPAE00017`).
 - On hardened firmware (`2C0359FPAE00017`) DHIP addUser is rejected for every variant — only a real `--admin-pass` session can add users there.
+- **Porta bind del fallback DHIP**: alcuni DVR (es. famiglie `7L03CB3PAZDA4B3`, `2L05BD6PAZ00030`) espongono DHIP **solo sulla porta 80** (il challenge su 5000 va in timeout) oppure accettano un solo canale PTCP. Il challenge ora ritorna `DhipChallengeInfo` (realm_id, porta, realm, random, session) e login+add/delete girano **sul canale live del challenge** (`dhip_add_on_challenge` / `dhip_try_delete_user` con `dhip_established_session` condiviso); le vie HTTP sono solo fallback. Prima il bind era hardcoded su 5000 (o richiedeva un re-bind) e questi seriali fallivano con `PTCP bind on port 5000 failed` / `PTCP bind failed on all ports`.
 
 ### Protocol
 - Working app uses HTTP POST to `/RPC2_Login` and `/RPC2`, not DHIP binary
@@ -120,14 +156,21 @@ Both `--http` and default mode go through this same flow. The only difference is
 - All other param shapes (`{"user": {...}}`, `{"account": {...}}`, arrays, `{"Id": N}`, etc.) fail with `268894211 "Request invalid param!"`
 - Sending a full user object (from `getUserInfoAll`) back to `deleteUser` can make the device drop the PTCP channel
 - `--delete-user <Id>` resolves the Id → Name via `getUserInfoAll`, then calls `deleteUser` with `{"name": <Name>}`
+- **`--delete-all`** (CLI `--delete-all`, GUI radio "delete all (keep admin)") deletes **every non-admin user** on each device. It lists users via `userManager.getUserInfoAll` and skips admin (Id==2 or name `admin`, case-insensitive), then deletes each remaining user by name (`{"name": <Name>}` variants, DHIP then HTTP/RPC2 fallback like single delete). Reports per-user success/failure and continues across the list; stops early on a DISC. HTTP login flow was factored into `http_establish_session` (shared by `http_try_delete_user` and `http_try_delete_all`). `http_establish_session` now supports `--try-defaults`: if the real password and bypass both fail, it tries the factory default admin passwords before giving up — matches `dhip_established_session` behavior.
 
 ## Error Codes
 - `268894209` = Invalid Request (console service not supported)
 - `268894210` = Method not found
 - `268894211` = Request invalid param (wrong parameter structure)
+- `268894212` = Server internal error (addUser rifiutato dal server — spesso su firmware hardened senza credenziali admin reali; a volte la sessione bypass viene accettata per login/list ma non per addUser)
 - `268959743` = Unknown error (service internal error — often privilege or validation)
+- `287637505` = Invalid session in request data (sessione scaduta o invalidata dopo errore precedente)
 
 ## Build
 - `cargo build` / `cargo run`
 - `cargo build --all-targets` — builds CLI + GUI + license-gen
 - `cargo build --release`
+
+## Robustness
+- **Pacchetti PTCP troncati**: alcuni relay/dispositivi mandano datagrammi malformati (es. payload 0x10 di 8 byte). I parser (`PTCPPayload::parse`, `PTCPBody::parse`, `PTCPPacket::parse`) e tutti i call site che affettano `[24..]` (`recv_until`, `wait_for_ptcp`, `dhip_recv`, `http_call`, hole-punch) sono difensivi: i pacchetti corti vengono ignorati invece di panincare (prima il processo moriva a metà batch, es. seriale 26/96 `1J034C5PAM00072`). Test di regressione: `short_malformed_packets_do_not_panic`.
+- **Rilevamento DISC (device disconnect)**: `http_call` imposta un flag `LAST_CALL_DISC` (AtomicBool, p2p.rs) quando riceve `PTCPBody::Status(_, "DISC")` dal dispositivo. I call site principali — `http_list_users_on_port` (query loop + getUser fallback), `http_delete_user` (varianti + alt_methods), `http_add_user` (Type loop) — verificano il flag dopo ogni `http_call` che ritorna `None` e abortono immediatemente con errore esplicativo, evitando ~30s × N tentativi inutili su canali morti.
