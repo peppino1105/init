@@ -36,7 +36,10 @@ struct GuiApp {
     nok_file: String,
     verbose: bool,
     try_defaults: bool,
+    timeout: String,
     snapshot: bool,
+    direct_http: bool,
+    rtsp: bool,
     log: Arc<Mutex<String>>,
     running: Arc<AtomicBool>,
     child: Arc<Mutex<Option<std::process::Child>>>,
@@ -82,11 +85,14 @@ impl GuiApp {
             admin_pass: String::new(),
             op: Op::AddUser,
             group_admin: true,
-            ok_file: "ok_serials.txt".into(),
-            nok_file: "nok_serials.txt".into(),
+            ok_file: String::new(),
+            nok_file: String::new(),
             verbose: false,
             try_defaults: false,
+            timeout: "0".into(),
             snapshot: false,
+            direct_http: false,
+            rtsp: false,
             log: Arc::new(Mutex::new(String::new())),
             running: Arc::new(AtomicBool::new(false)),
             child: Arc::new(Mutex::new(None)),
@@ -264,9 +270,13 @@ impl GuiApp {
             Op::CheckP2p => {}
         }
 
-        if self.snapshot && (user.is_empty() || password.is_empty()) {
+        if self.snapshot
+            && user.is_empty()
+            && password.is_empty()
+            && !matches!(self.op, Op::CheckP2p)
+        {
             self.log_line(
-                "[GUI] ERROR: snapshot requires user and password (camera stream credentials)",
+                "[GUI] ERROR: snapshot requires user and password (camera stream credentials) for add_user; for check_p2p the admin credentials are tried automatically",
             );
             return;
         }
@@ -286,6 +296,22 @@ impl GuiApp {
         }
         if self.try_defaults {
             args.push("--try-defaults".into());
+        }
+        let timeout = self.timeout.trim();
+        if !timeout.is_empty() && timeout != "0" {
+            match timeout.parse::<u64>() {
+                Ok(0) | Err(_) => {
+                    self.log_line(&format!(
+                        "[GUI] ERROR: invalid timeout '{}' (seconds, 0 = default)",
+                        timeout
+                    ));
+                    return;
+                }
+                Ok(secs) => {
+                    args.push("--timeout".into());
+                    args.push(secs.to_string());
+                }
+            }
         }
         let admin_user = self.admin_user.trim().to_string();
         if !admin_user.is_empty() {
@@ -313,6 +339,12 @@ impl GuiApp {
                 }
                 if self.snapshot {
                     args.push("--snapshot".into());
+                    if self.direct_http {
+                        args.push("--direct-http".into());
+                    }
+                    if self.rtsp {
+                        args.push("--rtsp".into());
+                    }
                 }
             }
             Op::List => {
@@ -336,19 +368,20 @@ impl GuiApp {
                 args.push("--check-p2p".into());
                 if self.snapshot {
                     args.push("--snapshot".into());
-                    args.push("-u".into());
-                    args.push(user.clone());
-                    args.push("-w".into());
-                    args.push(password.clone());
+                    if self.direct_http {
+                        args.push("--direct-http".into());
+                    }
+                    if self.rtsp {
+                        args.push("--rtsp".into());
+                    }
+                    if !user.is_empty() || !password.is_empty() {
+                        args.push("-u".into());
+                        args.push(user.clone());
+                        args.push("-w".into());
+                        args.push(password.clone());
+                    }
                 }
             }
-        }
-
-        if matches!(self.op, Op::AddUser | Op::Delete | Op::Reboot) {
-            args.push("--ok-file".into());
-            args.push(self.ok_file.clone());
-            args.push("--nok-file".into());
-            args.push(self.nok_file.clone());
         }
 
         if !self.generate_smartpss {
@@ -368,8 +401,34 @@ impl GuiApp {
         args.push("-f".into());
         args.push(serials_source.clone());
 
+        // Both sides derive the same names from the serials file, so the CLI
+        // is only told about them when the user has overridden them.
+        let (derived_ok, derived_nok) =
+            dahua_dhip_adduser::paths::log_files(Some(&serials_source), None);
+        let ok_path = if self.ok_file.trim().is_empty() {
+            derived_ok.clone()
+        } else {
+            self.ok_file.clone()
+        };
+        let nok_path = if self.nok_file.trim().is_empty() {
+            derived_nok.clone()
+        } else {
+            self.nok_file.clone()
+        };
+
+        if matches!(self.op, Op::AddUser | Op::Delete | Op::Reboot)
+            && (ok_path != derived_ok || nok_path != derived_nok)
+        {
+            args.push("--ok-file".into());
+            args.push(ok_path.clone());
+            args.push("--nok-file".into());
+            args.push(nok_path.clone());
+        }
+
+        // Only the stem: a full path would land the XML outside the working
+        // directory, or produce a nonsense name once prefixed with xml/.
         let xml_base = if use_file {
-            serials_source.clone()
+            dahua_dhip_adduser::paths::run_stem(Some(&serials_source), None)
         } else {
             let now: chrono::DateTime<chrono::Local> = chrono::Local::now();
             format!(
@@ -398,13 +457,19 @@ impl GuiApp {
         let child_slot = Arc::clone(&self.child);
         let gen_smartpss = self.generate_smartpss;
         let is_add = self.op == Op::AddUser;
-        let ok_file = self.ok_file.clone();
+        let ok_file = ok_path.clone();
         self.running.store(true, Ordering::SeqCst);
         self.status = "Running...".into();
 
         self.worker = Some(std::thread::spawn(move || {
             let mut cmd = Command::new(&cli);
             cmd.args(&args);
+            // The CLI writes snapshots/, ok/nok files and the failure log relative
+            // to its CWD. Launched from Finder the inherited CWD is "/", where
+            // creating those folders fails, so pin it to the binary's own folder.
+            if let Some(dir) = cli.parent() {
+                cmd.current_dir(dir);
+            }
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::piped());
 
@@ -623,6 +688,7 @@ fn generate_smartpss_file(
     }
     xml.push_str("\n\n</DeviceManager>\n");
 
+    dahua_dhip_adduser::paths::ensure_parent_dir(path).map_err(|e| e.to_string())?;
     std::fs::write(path, xml).map_err(|e| e.to_string())
 }
 
@@ -645,12 +711,15 @@ fn parse_serial_entry(raw: &str) -> (String, Option<String>) {
     (t.to_string(), None)
 }
 
+/// SmartPSS XML files live in their own folder, so a run does not litter the
+/// working directory. Splits every 22 entries, which is what SmartPSS imports
+/// per file.
 fn smartpss_paths(base: &str, n: usize) -> Vec<String> {
     if n <= 22 {
-        vec![format!("{}.xml", base)]
+        vec![dahua_dhip_adduser::paths::xml_file(&format!("{base}.xml"))]
     } else {
         (1..=n.div_ceil(22))
-            .map(|i| format!("{} ({}).xml", base, i))
+            .map(|i| dahua_dhip_adduser::paths::xml_file(&format!("{base} ({i}).xml")))
             .collect()
     }
 }
@@ -717,7 +786,7 @@ impl eframe::App for GuiApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("Dahua P2P — User Management");
+                ui.heading("Dahua P2P — User Management v1");
                 let prev_dark = self.dark_mode;
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.radio_value(&mut self.dark_mode, false, "Light");
@@ -809,15 +878,15 @@ impl eframe::App for GuiApp {
                     ui.label("Check P2P/cloud state of each device (account, status, public IP).");
                     if self.snapshot {
                         ui.horizontal(|ui| {
-                            ui.label("User:");
+                            ui.label("User (opt):");
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.user)
-                                    .hint_text("camera stream user"),
+                                    .hint_text("camera user (admin credentials tried first)"),
                             );
-                            ui.label("Password:");
+                            ui.label("Password (opt):");
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.password)
-                                    .hint_text("camera stream password"),
+                                    .hint_text("camera password (admin credentials tried first)"),
                             );
                         });
                     }
@@ -839,7 +908,14 @@ impl eframe::App for GuiApp {
                     can_snapshot,
                     egui::Checkbox::new(&mut self.snapshot, "Snapshot"),
                 );
-                if can_snapshot {
+                if self.snapshot && can_snapshot {
+                    ui.add_enabled(
+                        true,
+                        egui::Checkbox::new(&mut self.direct_http, "Direct HTTP"),
+                    );
+                    ui.add_enabled(true, egui::Checkbox::new(&mut self.rtsp, "RTSP"));
+                    ui.label("(fallback: P2P → SDK 37777 → direct IP → RTSP)");
+                } else if can_snapshot {
                     ui.label("(capture a live JPG per active camera channel)");
                 } else {
                     ui.label("(only with add_user or check_p2p)");
@@ -851,6 +927,14 @@ impl eframe::App for GuiApp {
                 ui.add(egui::TextEdit::singleline(&mut self.ok_file));
                 ui.label("NOK file:");
                 ui.add(egui::TextEdit::singleline(&mut self.nok_file));
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Timeout (s):");
+                ui.add(egui::TextEdit::singleline(&mut self.timeout).hint_text("0 = default"));
+                ui.label(
+                    "network timeout for PTCP/DHIP/HTTP calls (raise it on 'challenge timeout')",
+                );
                 ui.checkbox(&mut self.verbose, "Verbose");
                 ui.checkbox(&mut self.try_defaults, "Try default passwords");
             });
@@ -926,8 +1010,8 @@ impl eframe::App for GuiApp {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([920.0, 680.0])
-            .with_min_inner_size([700.0, 500.0])
+            .with_inner_size([1200.0, 680.0])
+            .with_min_inner_size([1000.0, 500.0])
             .with_title("Dahua P2P — User Management"),
         ..Default::default()
     };
@@ -1107,20 +1191,20 @@ mod tests {
     }
 
     #[test]
-    fn splits_smartpss_files_by_22() {
-        let b = "/tmp/serials.txt";
-        assert_eq!(smartpss_paths(b, 1), vec!["/tmp/serials.txt.xml"]);
-        assert_eq!(smartpss_paths(b, 22), vec!["/tmp/serials.txt.xml"]);
+    fn splits_smartpss_files_by_22_and_keeps_them_in_the_xml_folder() {
+        let b = "serials";
+        assert_eq!(smartpss_paths(b, 1), vec!["xml/serials.xml"]);
+        assert_eq!(smartpss_paths(b, 22), vec!["xml/serials.xml"]);
         assert_eq!(
             smartpss_paths(b, 23),
-            vec!["/tmp/serials.txt (1).xml", "/tmp/serials.txt (2).xml"]
+            vec!["xml/serials (1).xml", "xml/serials (2).xml"]
         );
         assert_eq!(
             smartpss_paths(b, 45),
             vec![
-                "/tmp/serials.txt (1).xml",
-                "/tmp/serials.txt (2).xml",
-                "/tmp/serials.txt (3).xml"
+                "xml/serials (1).xml",
+                "xml/serials (2).xml",
+                "xml/serials (3).xml"
             ]
         );
     }
