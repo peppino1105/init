@@ -116,10 +116,74 @@ fn build_hash_login_packet(user: &str, hash: &str) -> Vec<u8> {
     buf
 }
 
+/// Old-style DVRIP realm request (mcw0/DahuaConsole `dahua_dvrip_login`):
+/// `a0 01 00 00` + 20 zero bytes + `05 02 01 01 00 00 a1 aa`. Sent on the raw
+/// realm to force a `Realm:/Random:` challenge from firmware that speaks the
+/// binary DVRIP dialect instead of DHIP JSON. The new-style `a0 00 00 60`
+/// login packet gets no reply on such devices (e.g. 7J05198PAZ5E8B4).
+pub fn dvrip_realm_request() -> Vec<u8> {
+    let mut cmd = vec![0xa0, 0x01, 0x00, 0x00];
+    cmd.extend_from_slice(&[0u8; 20]);
+    cmd.extend_from_slice(&[0x05, 0x02, 0x01, 0x01, 0x00, 0x00, 0xa1, 0xaa]);
+    cmd
+}
+
+/// Old-style DVRIP hash login frame (`a0 05 00 00` + len(creds) LE + 16 zeros
+/// + `05 02 00 08 00 00 a1 aa` + `user&&hash`). Kept separate from
+/// `build_old_style_hash_login_packet` (which uses the `a0 05 00 60` prefix the
+/// CVE-2020-5735 trigger expects) so the two flows can be tuned independently.
+pub fn dvrip_hash_login_packet(user: &str, hash: &str) -> Vec<u8> {
+    let creds = format!("{}&&{}", user, hash);
+    let mut buf = vec![0xa0, 0x05, 0x00, 0x00];
+    buf.extend_from_slice(&(creds.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&[0u8; 16]);
+    buf.extend_from_slice(&[0x05, 0x02, 0x00, 0x08, 0x00, 0x00, 0xa1, 0xaa]);
+    buf.extend_from_slice(creds.as_bytes());
+    buf
+}
+
+/// Old-style DVRIP JSON frame header (mcw0/DahuaConsole `proto_header` dvrip):
+/// `f6 00 00 00` + len + id + 0 + len + 0 + session + 0, then the JSON body.
+/// Distinct from the DHIP frame (`20 00 00 00 "DHIP"` + session + id + len +
+/// 0 + len + 0) that our DHIP client builds; the field order and magic differ.
+pub fn dvrip_json_packet(session_id: u32, id: u32, json_str: &str) -> Vec<u8> {
+    let len = json_str.len() as u32;
+    let mut buf = Vec::with_capacity(32 + json_str.len());
+    buf.extend_from_slice(&0xf6000000u32.to_be_bytes());
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(&id.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&session_id.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(json_str.as_bytes());
+    buf
+}
+
 fn parse_challenge_body(body: &[u8]) -> Option<(String, String)> {
     let text = String::from_utf8_lossy(body);
-    let realm = extract_token(&text, "Realm:");
-    let random = extract_token(&text, "Random:");
+    // New-style/DHIP challenges use `Realm:<value>`; the old-style DVRIP
+    // challenge (mcw0/DahuaConsole `dahua_dvrip_login`) instead carries a bare
+    // `Login to <serial>` line with no `Realm:` prefix, so fall back to that.
+    let realm = extract_token(&text, "Realm:").or_else(|| {
+        let idx = text.find("Login to")?;
+        let after = &text[idx..];
+        let end = after.find("\r\n").unwrap_or(after.len());
+        Some(after[..end].trim().to_string())
+    });
+    let random = extract_token(&text, "Random:").or_else(|| {
+        // legacy realm line is followed by `Random:<hex>`; grab after last ':'
+        let idx = text.rfind(':')?;
+        let after = &text[idx + 1..];
+        let end = after.find("\r\n").unwrap_or(after.len());
+        let r = after[..end].trim().to_string();
+        if r.is_empty() {
+            None
+        } else {
+            Some(r)
+        }
+    });
     match (realm, random) {
         (Some(r), Some(rn)) if !r.is_empty() && !rn.is_empty() => Some((r, rn)),
         _ => None,
@@ -509,6 +573,163 @@ impl SdkClient {
         }
     }
 
+    /// Bind a fresh realm on the SDK port (37777) and complete an old-style
+    /// DVRIP login, returning `(realm_id, session_id, challenge_realm)` to use
+    /// for JSON calls. Used by the addUser-via-DVRIP path for firmware that
+    /// never answers DHIP.
+    pub async fn dvrip_open(
+        &self,
+        sock: &UdpSocket,
+        session: &Mutex<PTCPSession>,
+    ) -> Option<(u32, u32, String)> {
+        let realm = p2p::ptcp_bind(sock, session, SDK_PORT, Duration::from_secs(10)).await?;
+        self.debug(format!("dvrip_open: bound realm={} on SDK_PORT", realm))
+            .await;
+        self.dvrip_login_on_bind(sock, session, realm).await
+    }
+
+    /// Old-style DVRIP binary login: request a `Realm:/Random:` challenge with
+    /// the `a0 01` frame, answer with the `a0 05` hash frame. Returns the realm
+    /// id, the session id from response header bytes 16..20 on success, and the
+    /// challenge realm string (for the HA1 password hash).
+    pub async fn dvrip_login_on_bind(
+        &self,
+        sock: &UdpSocket,
+        session: &Mutex<PTCPSession>,
+        realm: u32,
+    ) -> Option<(u32, u32, String)> {
+        self.debug(format!(
+            "dvrip_login_on_bind realm={} user='{}'",
+            realm, self.user
+        ))
+        .await;
+        Self::send_realm(sock, session, realm, &dvrip_realm_request()).await;
+
+        let Some(resp) = p2p::sdk_read_realm(
+            sock,
+            session,
+            realm,
+            Duration::from_millis(200),
+            Duration::from_secs(10),
+        )
+        .await
+        else {
+            self.debug("dvrip: no reply to realm request".into()).await;
+            p2p::ptcp_disconnect(sock, session, realm).await;
+            return None;
+        };
+        self.debug(format!(
+            "dvrip realm resp len={} head=0x{:02X}{:02X} err=0x{:02X}{:02X}{:02X}{:02X}",
+            resp.len(),
+            resp.first().copied().unwrap_or(0),
+            resp.get(1).copied().unwrap_or(0),
+            resp.get(8).copied().unwrap_or(0),
+            resp.get(9).copied().unwrap_or(0),
+            resp.get(10).copied().unwrap_or(0),
+            resp.get(11).copied().unwrap_or(0),
+        ))
+        .await;
+
+        let Some((cr, crnd)) = parse_challenge_body(&resp) else {
+            self.debug("dvrip: realm resp carried no Realm/Random challenge".into())
+                .await;
+            p2p::ptcp_disconnect(sock, session, realm).await;
+            return None;
+        };
+        self.debug(format!("dvrip challenge realm='{}' rnd='{}'", cr, crnd))
+            .await;
+
+        let full_hash = sdk_login_hash(&self.user, &self.pass, &cr, &crnd);
+        self.debug(format!("dvrip sending hash login hash(len={})", full_hash.len()))
+            .await;
+        Self::send_realm(
+            sock,
+            session,
+            realm,
+            &dvrip_hash_login_packet(&self.user, &full_hash),
+        )
+        .await;
+
+        let Some(resp) = p2p::sdk_read_realm(
+            sock,
+            session,
+            realm,
+            Duration::from_millis(200),
+            Duration::from_secs(10),
+        )
+        .await
+        else {
+            self.debug("dvrip: no reply to hash login".into()).await;
+            p2p::ptcp_disconnect(sock, session, realm).await;
+            return None;
+        };
+        let sess = session_id_from_resp(&resp);
+        self.debug(format!(
+            "dvrip hash login resp len={} err=0x{:02X}{:02X} sess={}",
+            resp.len(),
+            resp.get(8).copied().unwrap_or(0),
+            resp.get(9).copied().unwrap_or(0),
+            sess,
+        ))
+        .await;
+        // Success is ErrorCode[0..2] == 00 08 (mcw0/DahuaConsole).
+        if resp.len() >= 10 && resp[8] == 0x00 && resp[9] == 0x08 {
+            Some((realm, sess, cr))
+        } else {
+            p2p::ptcp_disconnect(sock, session, realm).await;
+            None
+        }
+    }
+
+    /// DVRIP JSON exchange on an authenticated old-style realm: send `json` in
+    /// the `f6` frame and return the JSON body. DVRIP responses carry the body
+    /// length (LE) at header bytes 16..20 (mcw0/DahuaConsole `_p2p_len`), so the
+    /// JSON is `payload[32 .. 32 + len]`, not simply `payload[32..]`.
+    pub async fn dvrip_call(
+        &self,
+        sock: &UdpSocket,
+        session: &Mutex<PTCPSession>,
+        realm: u32,
+        session_id: u32,
+        id: u32,
+        json_str: &str,
+    ) -> Option<String> {
+        Self::send_realm(
+            sock,
+            session,
+            realm,
+            &dvrip_json_packet(session_id, id, json_str),
+        )
+        .await;
+        let raw = p2p::sdk_read_realm(
+            sock,
+            session,
+            realm,
+            Duration::from_millis(200),
+            Duration::from_secs(10),
+        )
+        .await?;
+        self.debug(format!(
+            "dvrip_call id={} resp len={} head=0x{:02X}{:02X}",
+            id,
+            raw.len(),
+            raw.first().copied().unwrap_or(0),
+            raw.get(1).copied().unwrap_or(0),
+        ))
+        .await;
+        if raw.len() <= 32 {
+            return None;
+        }
+        let body_len = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]) as usize;
+        let end = if body_len > 0 {
+            (32 + body_len).min(raw.len())
+        } else {
+            raw.len()
+        };
+        let json = std::str::from_utf8(&raw[32..end]).ok()?;
+        Some(json.trim_end_matches('\0').to_string())
+    }
+
     async fn sdk_exchange(
         &self,
         sock: &UdpSocket,
@@ -534,7 +755,24 @@ impl SdkClient {
             Some(r) => r,
             None => {
                 p2p::ptcp_disconnect(sock, session, realm).await;
-                return SdkInfo::LoginFailed;
+                // The new-style `a0 00 00 60` login got no answer / was rejected.
+                // Some firmware (binary DVRIP dialect, e.g. 7J05198PAZ5E8B4)
+                // only answers the old-style `a0 01` realm request, so retry the
+                // DVRIP flow on a fresh bind before giving up.
+                self.debug("new-style login failed, retrying with DVRIP old-style login".into())
+                    .await;
+                let Some(realm2) =
+                    p2p::ptcp_bind(sock, session, SDK_PORT, Duration::from_secs(5)).await
+                else {
+                    return SdkInfo::BindFailed;
+                };
+                match self.dvrip_login_on_bind(sock, session, realm2).await {
+                    Some((r, _sess, _)) => r,
+                    None => {
+                        p2p::ptcp_disconnect(sock, session, realm2).await;
+                        return SdkInfo::LoginFailed;
+                    }
+                }
             }
         };
 

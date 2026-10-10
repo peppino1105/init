@@ -1027,6 +1027,21 @@ async fn try_add_user(
         "DHIP challenge failed (no realm)".to_string()
     };
 
+    // The device never answered DHIP `global.login` on any port: it most likely
+    // speaks the old-style DVRIP binary dialect (SDK port 37777). Try addUser
+    // there before falling back to HTTP/RPC2.
+    if chal.is_none() {
+        match sdk_dvrip_add_user(sock, pcp_session, args).await {
+            Ok(()) => return Ok(resolve_geo(&device_ip).await),
+            Err(e) => {
+                if args.verbose {
+                    eprintln!("[debug] SDK/DVRIP addUser failed: {}", e);
+                }
+                last_err = e;
+            }
+        }
+    }
+
     // Il canale del challenge è probabilmente morto dopo il fallimento DHIP (alcuni
     // device accettano un solo canale PTCP e rifiutano il re-bind sulla stessa porta,
     // es. `PTCP bind failed on port 5000`). Nuovo handshake P2P fresco prima dei
@@ -1951,6 +1966,12 @@ async fn dhip_get_authority_list(
         }
     }
     // Fallback: Smart Manager authority list from sniff log analysis
+    default_authority_list()
+}
+
+/// Smart Manager authority list used when the device does not answer
+/// `userManager.getAuthorityList` (sniff log analysis).
+fn default_authority_list() -> Vec<String> {
     vec![
         "Monitor".into(),
         "Monitor_01".into(),
@@ -1974,6 +1995,194 @@ async fn dhip_get_authority_list(
         "AuthBackup".into(),
         "AuthMaintence".into(),
     ]
+}
+
+/// Add a user over the old-style DVRIP binary dialect on the SDK port (37777).
+/// Used for firmware that never answers DHIP `global.login` (e.g. China-market
+/// devp2p 6.7.5). Binds a realm, logs in with the device admin credentials, then
+/// sends `userManager.addUser` (+ `configManager.setConfig` on the Account
+/// table) as DVRIP `f6` JSON frames. The stored HA1 is
+/// `MD5(user:<dvrip challenge realm>:password)`, same SmartPSS-compatible format
+/// as the DHIP path.
+async fn sdk_dvrip_add_user(
+    sock: &UdpSocket,
+    pcp_session: &Mutex<PTCPSession>,
+    args: &Args,
+) -> Result<(), String> {
+    // Device-side admin credentials, tried like the SDK snapshot flow.
+    let mut creds: Vec<(String, String)> = Vec::new();
+    if !args.admin_pass.is_empty() {
+        creds.push((args.admin_user.clone(), args.admin_pass.clone()));
+    }
+    if args.try_defaults {
+        for pw in DEFAULT_ADMIN_PASSWORDS {
+            if args.admin_pass == *pw {
+                continue;
+            }
+            creds.push((args.admin_user.clone(), (*pw).to_string()));
+        }
+    }
+    // last resort: blank password (devices never configured by an installer)
+    if args.admin_pass.is_empty() {
+        creds.push((args.admin_user.clone(), String::new()));
+    }
+
+    let mut last_err = "DVRIP login failed".to_string();
+    for (auser, apass) in &creds {
+        let client = sdk::SdkClient::new(auser, apass).with_verbose(args.verbose);
+        let Some((realm_id, sid, chal_realm)) = client.dvrip_open(sock, pcp_session).await else {
+            last_err = "DVRIP bind/login failed".to_string();
+            continue;
+        };
+        if args.verbose {
+            eprintln!(
+                "  [debug] DVRIP login ok (realm={} sid={} chal='{}')",
+                realm_id, sid, chal_realm
+            );
+        }
+
+        // Duplicate pre-check while the session is healthy.
+        let list_req = json!({"id": 100, "method": "userManager.getUserInfoAll",
+            "params": {}, "session": sid});
+        if let Some(t) = client
+            .dvrip_call(sock, pcp_session, realm_id, sid, 100, &list_req.to_string())
+            .await
+        {
+            if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                if let Some(users) = v
+                    .get("params")
+                    .and_then(|p| p.get("users"))
+                    .and_then(|u| u.as_array())
+                {
+                    if users
+                        .iter()
+                        .any(|u| u.get("Name").and_then(|n| n.as_str()) == Some(args.user.as_str()))
+                    {
+                        println!(
+                            "  [!] user '{}' already exists on device, skipping",
+                            &args.user
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        // Authority list (fall back to the sniffed Smart Manager list).
+        let al_req = json!({"id": 101, "method": "userManager.getAuthorityList",
+            "params": {}, "session": sid});
+        let mut authority_list: Vec<String> = Vec::new();
+        if let Some(t) = client
+            .dvrip_call(sock, pcp_session, realm_id, sid, 101, &al_req.to_string())
+            .await
+        {
+            if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                if let Some(arr) = v.get("params").and_then(|p| p.as_array()) {
+                    authority_list = arr
+                        .iter()
+                        .filter_map(|s| s.as_str().map(String::from))
+                        .collect();
+                }
+            }
+        }
+        if authority_list.is_empty() {
+            authority_list = default_authority_list();
+        }
+
+        let group = if args.group == "user" { "user" } else { "admin" };
+        let authority_list: Vec<String> = if group == "user" {
+            authority_list
+                .into_iter()
+                .filter(|a| a.starts_with("Monitor") || a.starts_with("Replay"))
+                .collect()
+        } else {
+            authority_list
+        };
+        let types: &[&str] = if group == "user" {
+            &["Normal"]
+        } else {
+            &["Admin", "Operator", "Normal"]
+        };
+
+        let pw_hash = http_adduser_password_hash(&args.user, &chal_realm, &args.password);
+
+        for utype in types {
+            let user_obj = json!({
+                "Name": &args.user, "Password": pw_hash,
+                "Group": group, "Memo": &args.memo, "Type": utype,
+                "passwordType": "Default",
+                "AuthorityList": authority_list.clone(),
+            });
+            let req = json!({"id": 100, "method": "userManager.addUser",
+                "params": {"user": user_obj}, "session": sid});
+            match client
+                .dvrip_call(sock, pcp_session, realm_id, sid, 100, &req.to_string())
+                .await
+            {
+                Some(t) => {
+                    if args.verbose {
+                        eprintln!("[debug] DVRIP addUser(Type={}) response: {}", utype, t);
+                    }
+                    if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                        if v.get("result").and_then(|r| r.as_bool()).unwrap_or(false) {
+                            println!("  [+] user added via DVRIP (Type={})", utype);
+                            let set_params = json!({"name": "Account", "table": {"User": [{
+                                "Name": &args.user, "Password": &args.password,
+                                "Group": group, "Memo": &args.memo, "Type": utype,
+                                "passwordType": "Default",
+                                "AuthorityList": authority_list,
+                            }]}});
+                            let set_req = json!({"id": 220, "method": "configManager.setConfig",
+                                "params": set_params, "session": sid});
+                            if let Some(t2) = client
+                                .dvrip_call(
+                                    sock,
+                                    pcp_session,
+                                    realm_id,
+                                    sid,
+                                    220,
+                                    &set_req.to_string(),
+                                )
+                                .await
+                            {
+                                if t2.contains("result\":true") {
+                                    println!("  [+] Account table updated with plaintext password");
+                                }
+                            }
+                            return Ok(());
+                        }
+                        let err_str = v
+                            .get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("");
+                        if err_str.to_lowercase().contains("exist")
+                            || t.to_lowercase().contains("exist")
+                        {
+                            println!(
+                                "  [!] user '{}' already exists on device, skipping",
+                                &args.user
+                            );
+                            return Ok(());
+                        }
+                        last_err = if err_str.is_empty() {
+                            format!("DVRIP addUser failed (Type={})", utype)
+                        } else {
+                            format!("DVRIP addUser failed (Type={}): {}", utype, err_str)
+                        };
+                    } else {
+                        last_err = "DVRIP addUser returned non-JSON".to_string();
+                    }
+                }
+                None => last_err = "DVRIP addUser got no reply".to_string(),
+            }
+        }
+
+        // No type succeeded on this credential set: release the realm and try the
+        // next candidate (if any).
+        ptcp_disconnect(sock, pcp_session, realm_id).await;
+    }
+    Err(last_err)
 }
 
 /// Perform DHIP challenge and return the realm info plus the live channel.
@@ -2544,29 +2753,7 @@ async fn http_get_authority_list(
     }
 
     // Fallback: Smart Manager authority list from sniff log analysis
-    vec![
-        "Monitor".into(),
-        "Monitor_01".into(),
-        "Monitor_02".into(),
-        "Monitor_03".into(),
-        "Monitor_04".into(),
-        "Replay".into(),
-        "Replay_01".into(),
-        "Replay_02".into(),
-        "Replay_03".into(),
-        "Replay_04".into(),
-        "AuthUserMag".into(),
-        "AuthSysCfg".into(),
-        "AuthSysInfo".into(),
-        "AuthManuCtr".into(),
-        "AuthStoreCfg".into(),
-        "AuthEventCfg".into(),
-        "AuthNetCfg".into(),
-        "AuthRmtDevice".into(),
-        "AuthSecurity".into(),
-        "AuthBackup".into(),
-        "AuthMaintence".into(),
-    ]
+    default_authority_list()
 }
 
 async fn http_logout(
