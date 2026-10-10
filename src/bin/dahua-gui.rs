@@ -592,8 +592,10 @@ impl GuiApp {
 ///
 /// Recognised patterns (see `main.rs`):
 /// - `[i/N] <serial>` — per-serial header (processed/total)
-/// - `[+] <serial> → OK` / `  [+] user ... deleted via ...` — OK
+/// - `[+] <serial> → OK` — add_user success (also covers "already exists": the
+///   CLI prints the `[!] ... already exists ...` note AND the `→ OK` line)
 /// - `[-] <serial> → FAIL: ...` / `  [-] P2P handshake failed: ...` — NOK
+/// - `  [+] user ... deleted via ...` — delete success (delete has no `→ OK`)
 /// - `[*] DONE — X OK, Y FAIL out of Z` — authoritative final summary
 fn parse_progress(s: &str) -> (usize, usize, usize, usize) {
     let mut processed = 0;
@@ -628,7 +630,10 @@ fn parse_progress(s: &str) -> (usize, usize, usize, usize) {
             || t.contains("Failed to delete user")
         {
             nok += 1;
-        } else if t.contains("deleted via") || t.contains("already exists on device") {
+        } else if t.contains("deleted via") {
+            // Delete flow only: success is reported here, with no `→ OK` line.
+            // Do NOT also count the add flow's `already exists` note — it is
+            // always followed by a `→ OK` line and would double-count.
             ok += 1;
         }
         if t.starts_with("[*] DONE") {
@@ -974,8 +979,11 @@ impl eframe::App for GuiApp {
                 ui.label(&self.status);
                 let (processed, total, ok, nok) = self.progress();
                 if total > 0 {
-                    let counter =
-                        format!("    [{}/{}]  OK: {}  NOK: {}", processed, total, ok, nok);
+                    let pct = (processed as f64 / total as f64 * 100.0).round() as usize;
+                    let counter = format!(
+                        "    [{}/{}]  {}%  OK: {}  NOK: {}",
+                        processed, total, pct, ok, nok
+                    );
                     ui.add(egui::Label::new(
                         egui::RichText::new(counter).monospace().strong(),
                     ));
@@ -1080,6 +1088,28 @@ mod tests {
 [*] DONE \u{2014} 1 OK, 0 FAIL out of 1
 ";
         assert_eq!(parse_progress(log), (1, 1, 1, 0));
+    }
+
+    #[test]
+    fn existing_users_do_not_double_count_live() {
+        // Mid-run the authoritative `[*] DONE` line has not appeared yet, so the
+        // live counters must not count both the `already exists` note and the
+        // `→ OK` line for the same serial.
+        let log = "\
+[1/3] SERIALAAA
+  [!] user 'camuser1' already exists on device, skipping
+[+] SERIALAAA \u{2192} OK
+
+[2/3] SERIALBBB
+  [!] user 'camuser2' already exists on device, skipping
+[+] SERIALBBB \u{2192} OK
+
+[3/3] SERIALCCC
+  [+] user added via DHIP (Type=Admin)
+[+] SERIALCCC \u{2192} OK
+
+";
+        assert_eq!(parse_progress(log), (3, 3, 3, 0));
     }
 
     #[test]
