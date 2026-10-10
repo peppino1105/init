@@ -98,7 +98,11 @@ async fn try_capture_on_port(
                     "  [debug] rtsp: OPTIONS retry -> {}",
                     r.lines().next().unwrap_or("")
                 );
-                if !r.contains("200") {
+                // Some Dahua RTSP servers keep answering 401 to OPTIONS even
+                // with a correct Digest (they only honor it on DESCRIBE/SETUP).
+                // Fail only on a hard error, not on a repeat 401 — the
+                // challenge from the first response is still good.
+                if !r.contains("200") && !r.contains("401") {
                     return None;
                 }
             } else {

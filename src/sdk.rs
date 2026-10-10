@@ -620,8 +620,13 @@ impl SdkClient {
             sock,
             session,
             realm,
-            Duration::from_millis(200),
+            // p2pwn reads the snapshot reply in 5 s chunks and only finishes
+            // once the JPEG EOI shows up (sdkbin.go, GetSnapshot). A 200 ms
+            // window aborts on the pauses DVRs take between encode segments,
+            // truncating the frame (7F00CB6PAZ3FC73, 9112-byte JPEG cut at
+            // 2205 bytes).
             Duration::from_secs(5),
+            Duration::from_secs(60),
         )
         .await;
         self.debug(format!(

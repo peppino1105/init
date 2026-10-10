@@ -311,13 +311,26 @@ impl PTCPSession {
     }
 
     pub fn recv(&mut self, packet: PTCPPacket) -> PTCPPacket {
-        self.recv += packet.body.len() as u32;
+        // Match p2pwn's accounting: the ack we send must reflect the *peer's*
+        // advertised stream position (its Sent + payload), raised monotonically.
+        // Cumulative `+=` under-counts whenever a datagram is lost or reordered,
+        // and a lagging Recv stalls the peer's window mid-response — observed as
+        // JPEG bodies cut short at ~2-4 KB (`7F00CB6PAZ3FC73`, Content-Length
+        // 10244, 3484 bytes delivered, then silence). p2pwn reads full bodies.
+        let adv = packet.sent.saturating_add(packet.body.len() as u32);
+        if adv > self.recv {
+            self.recv = adv;
+        }
         self.rmid = packet.lmid;
         packet
     }
 
     pub fn recv_only_bytes(&mut self, packet: &PTCPPacket) {
-        self.recv += packet.body.len() as u32;
+        let adv = packet.sent.saturating_add(packet.body.len() as u32);
+        if adv > self.recv {
+            self.recv = adv;
+        }
+        self.rmid = packet.lmid;
     }
 }
 
@@ -328,7 +341,9 @@ pub async fn udp_send(sock: &UdpSocket, buf: &[u8]) {
 }
 
 pub async fn udp_recv(sock: &UdpSocket, dur: Duration) -> Option<Vec<u8>> {
-    let mut buf = [0u8; 4096];
+    // 64 KB like p2pwn: a PTCP body may span several datagrams, but a single
+    // large payload must never be truncated by the read buffer.
+    let mut buf = vec![0u8; 65536];
     match timeout(dur, sock.recv(&mut buf)).await {
         Ok(Ok(n)) => Some(buf[..n].to_vec()),
         _ => None,
@@ -2672,6 +2687,20 @@ fn body_contains(body: &[u8], needles: &[&[u8]]) -> bool {
     needles.iter().any(|n| find_bytes(body, n).is_some())
 }
 
+/// Stall (per-datagram activity window) used once HTTP headers exist and the
+/// body framing says more data is coming. Dahua DVRs stream `snapshot.cgi`
+/// JPEGs on demand and can pause several seconds between datagrams; a short
+/// window truncated a 9112-byte frame at 2205 bytes on `7F00CB6PAZ3FC73` and
+/// then left the device's web server wedged for every later bind. Overridable
+/// with `DAHUA_BODY_S` (seconds).
+fn http_body_stall() -> Duration {
+    std::env::var("DAHUA_BODY_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(20))
+}
+
 /// Decide whether the accumulated response is complete.
 ///
 /// Mirrors `DoHTTPOnRealm` (tunnel.go:591). The case that matters for us is
@@ -3082,6 +3111,7 @@ pub async fn http_exchange_on_realm(
     let mut body_offset = 0usize;
     let mut headers = String::new();
     let mut chunked = false;
+    let body_stall = http_body_stall().max(timeout);
 
     loop {
         let now = tokio::time::Instant::now();
@@ -3089,7 +3119,7 @@ pub async fn http_exchange_on_realm(
         // with the payload stream so large responses (a 60 KB JPEG is dozens of
         // datagrams) are not cut short.
         let remaining = if have_headers {
-            (last_activity + timeout).saturating_duration_since(now)
+            (last_activity + body_stall).saturating_duration_since(now)
         } else {
             deadline.saturating_duration_since(now)
         };
@@ -3127,6 +3157,22 @@ pub async fn http_exchange_on_realm(
                     udp_send(sock, &s.send(PTCPBody::Empty).serialize()).await;
                 }
                 buf.extend_from_slice(&p.data);
+
+                if std::env::var_os("DAHUA_TRUNC_DEBUG").is_some() {
+                    let total_ms = timeout
+                        .checked_sub(
+                            deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                        .unwrap_or_default()
+                        .as_millis();
+                    eprintln!(
+                        "[trunc] realm={} +{}b → {}b total, t-{}ms",
+                        realm_id,
+                        p.data.len(),
+                        buf.len(),
+                        total_ms
+                    );
+                }
 
                 if !have_headers {
                     let Some(pos) = find_bytes(&buf, b"\r\n\r\n") else {
@@ -3180,6 +3226,54 @@ pub async fn http_exchange_on_realm(
         body = dechunk_http(&body);
     }
     Some((headers, body))
+}
+
+/// Basic-auth GET sent over an **already-open** PTCP realm (the live DHIP
+/// challenge channel) instead of a fresh bind.
+///
+/// This is the pre-f744c3c snapshot transport. A number of DVRs accept a
+/// single PTCP channel and only serve their web API on the channel that
+/// currently carries the DHIP session: `7C03FF7PAZ93E44` answered 200 on the
+/// challenge realm while every fresh bind drew silence. The Base64 auth rides
+/// in the same datagram as the request, so no challenge/401 round-trip is
+/// needed and the channel is never torn down.
+pub async fn http_get_binary_on_realm(
+    sock: &UdpSocket,
+    pcp_session: &Mutex<PTCPSession>,
+    realm_id: u32,
+    host: &str,
+    path: &str,
+    timeout: Duration,
+    user: &str,
+    password: &str,
+    cookie_session: &str,
+) -> Option<(String, Vec<u8>)> {
+    let auth = if user.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Authorization: Basic {}\r\n",
+            base64_encode_basic(&format!("{}:{}", user, password))
+        )
+    };
+    let cookie = if cookie_session.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Cookie: DhWebClientSessionID={}; WebClientSessionID={}\r\n",
+            cookie_session, cookie_session
+        )
+    };
+    let http_request = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Accept-Encoding: identity\r\n\
+         Connection: close\r\n\
+         User-Agent: DahuaDhipAdduser\r\n\
+         {auth}{cookie}\
+         Host: {host}\r\n\
+         \r\n"
+    );
+    http_exchange_on_realm(sock, pcp_session, realm_id, &http_request, timeout).await
 }
 
 /// `ptcp_bind` with a retry: it sends a single Bind datagram and gives up, and

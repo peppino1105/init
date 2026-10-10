@@ -8,3 +8,4 @@ nok_serials_*.txt
 ok_serials._*.txt
 licence.lic
 /snapshots/
+/xml/
