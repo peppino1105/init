@@ -287,8 +287,101 @@ pub enum SdkInfo {
     /// The PTCP bind on 37777 never established. No credential can fix
     /// that, so retrying with other logins only burns time.
     BindFailed,
-    /// The bind worked but these credentials were rejected.
-    LoginFailed,
+    /// The device answered the bind but rejected the login with a classified
+    /// error (wrong password, locked account, …). Carries the detail so the
+    /// caller can stop retrying when retries would lock the account.
+    AuthRejected(SdkLoginError),
+}
+
+/// Why an SDK/DVRIP login was rejected, so callers can tell a wrong password
+/// from a locked account instead of blindly burning the device's remaining
+/// login attempts (which locks it — e.g. 7C03FF7PAZ93E44 hit `01 04`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SdkLoginError {
+    /// The PTCP bind on 37777 never established.
+    BindFailed,
+    /// No reply / malformed reply to a login frame.
+    NoReply,
+    /// `01 00`: wrong password. `auth_code` is the device's AuthCode field
+    /// (response bytes 28..32, big-endian) — the remaining-attempts counter on
+    /// firmware that reports one.
+    AuthFailed { auth_code: Option<u32> },
+    /// `01 01`: the username is not valid on the device.
+    UsernameInvalid,
+    /// `01 04`: the account is locked after too many failed attempts.
+    AccountLocked,
+    /// `01 05` / `01 11` / `01 13`: device not initialised / not implemented.
+    NotSupported,
+    /// Any other error code (`ErrorCode[0..2]`).
+    Other(u8, u8),
+}
+
+impl SdkLoginError {
+    /// True when retrying with another credential is pointless and would only
+    /// keep decrementing the device's login-attempt budget.
+    pub fn should_abort(&self) -> bool {
+        match self {
+            SdkLoginError::AccountLocked | SdkLoginError::UsernameInvalid => true,
+            SdkLoginError::AuthFailed { auth_code } => {
+                matches!(auth_code, Some(c) if *c > 0 && *c <= 2)
+            }
+            _ => false,
+        }
+    }
+
+    /// Short human-readable description for CLI/verbose output.
+    pub fn describe(&self) -> String {
+        match self {
+            SdkLoginError::BindFailed => "PTCP bind on 37777 failed".to_string(),
+            SdkLoginError::NoReply => "no reply to SDK login".to_string(),
+            SdkLoginError::AuthFailed { auth_code } => match auth_code {
+                Some(c) if *c > 0 => format!("wrong password ({} attempt(s) left)", c),
+                _ => "wrong password".to_string(),
+            },
+            SdkLoginError::UsernameInvalid => "username invalid".to_string(),
+            SdkLoginError::AccountLocked => "account locked".to_string(),
+            SdkLoginError::NotSupported => "login not supported by device".to_string(),
+            SdkLoginError::Other(a, b) => format!("login error 0x{:02X}{:02X}", a, b),
+        }
+    }
+}
+
+/// Classify an SDK/DVRIP login response. Success is `ErrorCode[0..2] == 00 08`
+/// (mcw0/DahuaConsole). A valid error frame carries the ErrorCode at header
+/// bytes 8..10 and, for auth failures, the AuthCode counter at bytes 28..32
+/// (big-endian).
+pub fn classify_login_response(resp: &[u8]) -> Result<(), SdkLoginError> {
+    if resp.len() >= 10 && resp[8] == 0x00 && resp[9] == 0x08 {
+        return Ok(());
+    }
+    if resp.len() < 10 {
+        return Err(SdkLoginError::NoReply);
+    }
+    let auth_code = if resp.len() >= 32 {
+        let c = u32::from_be_bytes([resp[28], resp[29], resp[30], resp[31]]);
+        if c == 0 { None } else { Some(c) }
+    } else {
+        None
+    };
+    Err(match (resp[8], resp[9]) {
+        (0x01, 0x00) => SdkLoginError::AuthFailed { auth_code },
+        (0x01, 0x01) => SdkLoginError::UsernameInvalid,
+        (0x01, 0x04) => SdkLoginError::AccountLocked,
+        (0x01, 0x05) | (0x01, 0x11) | (0x01, 0x13) => SdkLoginError::NotSupported,
+        (a, b) => SdkLoginError::Other(a, b),
+    })
+}
+
+/// A logged-in SDK channel on the SDK port (37777). The device login is
+/// per-device, not per-channel, so callers bind/login once via
+/// [`SdkClient::open_session`] and reuse it for every channel snapshot.
+/// `session_id`/`challenge_realm` are the DVRIP login material, kept for the
+/// old-style JSON path.
+#[allow(dead_code)]
+pub struct SdkSession {
+    pub realm: u32,
+    pub session_id: u32,
+    pub challenge_realm: String,
 }
 
 impl SdkClient {
@@ -309,6 +402,57 @@ impl SdkClient {
         if self.verbose {
             eprintln!("  [debug] sdk: {}", msg);
         }
+    }
+
+    /// Bind a realm on the SDK port and log in once, returning a reusable
+    /// session. Prefers the new-style `loginPacket`; falls back to the
+    /// old-style DVRIP dialect for firmware that ignores it. Unlike
+    /// `get_snapshot`, the realm is **not** disconnected here — the caller owns
+    /// it and must release it with [`SdkClient::close_session`].
+    pub async fn open_session(
+        &self,
+        sock: &UdpSocket,
+        session: &Mutex<PTCPSession>,
+    ) -> Result<SdkSession, SdkLoginError> {
+        let bound = p2p::ptcp_bind(sock, session, SDK_PORT, Duration::from_secs(5))
+            .await
+            .ok_or(SdkLoginError::BindFailed)?;
+        self.debug(format!("open_session: bound realm={} on SDK_PORT", bound))
+            .await;
+
+        if let Some(realm) = self.login_on_bind(sock, session, bound).await {
+            return Ok(SdkSession {
+                realm,
+                session_id: 0,
+                challenge_realm: String::new(),
+            });
+        }
+        // `login_on_bind` can return None with the first bind still open (a
+        // rejection that is not a challenge). Release it before the DVRIP retry.
+        p2p::ptcp_disconnect(sock, session, bound).await;
+
+        self.debug("open_session: new-style login failed, retrying DVRIP old-style".into())
+            .await;
+        let realm2 = p2p::ptcp_bind(sock, session, SDK_PORT, Duration::from_secs(5))
+            .await
+            .ok_or(SdkLoginError::BindFailed)?;
+        let (realm, session_id, challenge_realm) =
+            self.dvrip_login_on_bind(sock, session, realm2).await?;
+        Ok(SdkSession {
+            realm,
+            session_id,
+            challenge_realm,
+        })
+    }
+
+    /// Release a session opened by [`SdkClient::open_session`].
+    pub async fn close_session(
+        &self,
+        sock: &UdpSocket,
+        session: &Mutex<PTCPSession>,
+        sdk: &SdkSession,
+    ) {
+        p2p::ptcp_disconnect(sock, session, sdk.realm).await;
     }
 
     async fn send_realm(sock: &UdpSocket, session: &Mutex<PTCPSession>, realm: u32, data: &[u8]) {
@@ -581,8 +725,10 @@ impl SdkClient {
         &self,
         sock: &UdpSocket,
         session: &Mutex<PTCPSession>,
-    ) -> Option<(u32, u32, String)> {
-        let realm = p2p::ptcp_bind(sock, session, SDK_PORT, Duration::from_secs(10)).await?;
+    ) -> Result<(u32, u32, String), SdkLoginError> {
+        let realm = p2p::ptcp_bind(sock, session, SDK_PORT, Duration::from_secs(10))
+            .await
+            .ok_or(SdkLoginError::BindFailed)?;
         self.debug(format!("dvrip_open: bound realm={} on SDK_PORT", realm))
             .await;
         self.dvrip_login_on_bind(sock, session, realm).await
@@ -597,7 +743,7 @@ impl SdkClient {
         sock: &UdpSocket,
         session: &Mutex<PTCPSession>,
         realm: u32,
-    ) -> Option<(u32, u32, String)> {
+    ) -> Result<(u32, u32, String), SdkLoginError> {
         self.debug(format!(
             "dvrip_login_on_bind realm={} user='{}'",
             realm, self.user
@@ -616,7 +762,7 @@ impl SdkClient {
         else {
             self.debug("dvrip: no reply to realm request".into()).await;
             p2p::ptcp_disconnect(sock, session, realm).await;
-            return None;
+            return Err(SdkLoginError::NoReply);
         };
         self.debug(format!(
             "dvrip realm resp len={} head=0x{:02X}{:02X} err=0x{:02X}{:02X}{:02X}{:02X}",
@@ -634,7 +780,7 @@ impl SdkClient {
             self.debug("dvrip: realm resp carried no Realm/Random challenge".into())
                 .await;
             p2p::ptcp_disconnect(sock, session, realm).await;
-            return None;
+            return Err(SdkLoginError::NoReply);
         };
         self.debug(format!("dvrip challenge realm='{}' rnd='{}'", cr, crnd))
             .await;
@@ -661,23 +807,29 @@ impl SdkClient {
         else {
             self.debug("dvrip: no reply to hash login".into()).await;
             p2p::ptcp_disconnect(sock, session, realm).await;
-            return None;
+            return Err(SdkLoginError::NoReply);
         };
         let sess = session_id_from_resp(&resp);
+        let classified = classify_login_response(&resp);
         self.debug(format!(
-            "dvrip hash login resp len={} err=0x{:02X}{:02X} sess={}",
+            "dvrip hash login resp len={} err=0x{:02X}{:02X} auth=0x{:02X}{:02X}{:02X}{:02X} sess={} → {:?}",
             resp.len(),
             resp.get(8).copied().unwrap_or(0),
             resp.get(9).copied().unwrap_or(0),
+            resp.get(28).copied().unwrap_or(0),
+            resp.get(29).copied().unwrap_or(0),
+            resp.get(30).copied().unwrap_or(0),
+            resp.get(31).copied().unwrap_or(0),
             sess,
+            classified,
         ))
         .await;
-        // Success is ErrorCode[0..2] == 00 08 (mcw0/DahuaConsole).
-        if resp.len() >= 10 && resp[8] == 0x00 && resp[9] == 0x08 {
-            Some((realm, sess, cr))
-        } else {
-            p2p::ptcp_disconnect(sock, session, realm).await;
-            None
+        match classified {
+            Ok(()) => Ok((realm, sess, cr)),
+            Err(e) => {
+                p2p::ptcp_disconnect(sock, session, realm).await;
+                Err(e)
+            }
         }
     }
 
@@ -767,10 +919,10 @@ impl SdkClient {
                     return SdkInfo::BindFailed;
                 };
                 match self.dvrip_login_on_bind(sock, session, realm2).await {
-                    Some((r, _sess, _)) => r,
-                    None => {
-                        p2p::ptcp_disconnect(sock, session, realm2).await;
-                        return SdkInfo::LoginFailed;
+                    Ok((r, _sess, _)) => r,
+                    Err(e) => {
+                        // dvrip_login_on_bind already released realm2 on error.
+                        return SdkInfo::AuthRejected(e);
                     }
                 }
             }
@@ -807,12 +959,14 @@ impl SdkClient {
         }
     }
 
-    /// Capture a JPEG snapshot for the given channel (1-based, mirrors p2pwn
-    /// GetSnapshot: channel 1 -> byte 0).
-    pub async fn get_snapshot(
+    /// Capture a JPEG snapshot on an already-authenticated session (no
+    /// re-login). The channel is 1-based (mirrors p2pwn GetSnapshot: channel 1
+    /// -> byte 0). The realm stays bound; release it separately.
+    pub async fn snapshot_on(
         &self,
         sock: &UdpSocket,
         session: &Mutex<PTCPSession>,
+        sdk: &SdkSession,
         channel: usize,
     ) -> Option<Vec<u8>> {
         let ch = if channel > 0 {
@@ -821,43 +975,22 @@ impl SdkClient {
             0
         };
 
-        let bound = p2p::ptcp_bind(sock, session, SDK_PORT, Duration::from_secs(5)).await?;
-        self.debug(format!(
-            "get_snapshot ch{}: bound realm={} on SDK_PORT",
-            channel, bound
-        ))
-        .await;
-        let Some(realm) = self.login_on_bind(sock, session, bound).await else {
-            // login_on_bind can return None after moving to a second realm; close
-            // the original bind either way so a failed attempt does not leak it.
-            p2p::ptcp_disconnect(sock, session, bound).await;
-            return None;
-        };
-        let moved = realm != bound;
-        self.debug(format!(
-            "get_snapshot ch{}: logged in, realm={}{}",
-            channel,
-            realm,
-            if moved { " (hash-moved)" } else { "" }
-        ))
-        .await;
-
         // drain any leftover frames before requesting the snapshot
         let _ = p2p::sdk_read_realm(
             sock,
             session,
-            realm,
+            sdk.realm,
             Duration::from_millis(50),
             Duration::from_millis(200),
         )
         .await;
 
-        Self::send_realm(sock, session, realm, &snapshot_cmd(ch)).await;
+        Self::send_realm(sock, session, sdk.realm, &snapshot_cmd(ch)).await;
 
         let data = p2p::sdk_read_realm(
             sock,
             session,
-            realm,
+            sdk.realm,
             // p2pwn reads the snapshot reply in 5 s chunks and only finishes
             // once the JPEG EOI shows up (sdkbin.go, GetSnapshot). A 200 ms
             // window aborts on the pauses DVRs take between encode segments,
@@ -868,16 +1001,11 @@ impl SdkClient {
         )
         .await;
         self.debug(format!(
-            "get_snapshot ch{}: snapshot reply len={:?}",
+            "snapshot_on ch{}: snapshot reply len={:?}",
             channel,
             data.as_ref().map(|d| d.len())
         ))
         .await;
-
-        if moved {
-            p2p::ptcp_disconnect(sock, session, bound).await;
-        }
-        p2p::ptcp_disconnect(sock, session, realm).await;
 
         let mut data = match data {
             Some(d) if d.len() >= 32 => d[32..].to_vec(),
@@ -894,5 +1022,64 @@ impl SdkClient {
             return Some(data);
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_login_response, SdkLoginError};
+
+    fn frame(err: [u8; 2], auth: [u8; 4]) -> Vec<u8> {
+        let mut v = vec![0u8; 32];
+        v[8] = err[0];
+        v[9] = err[1];
+        v[28..32].copy_from_slice(&auth);
+        v
+    }
+
+    #[test]
+    fn success_is_error_code_00_08() {
+        let f = frame([0x00, 0x08], [0, 0, 0, 0]);
+        assert_eq!(classify_login_response(&f), Ok(()));
+    }
+
+    #[test]
+    fn auth_failed_carries_attempts_left() {
+        let f = frame([0x01, 0x00], [0, 0, 0, 5]);
+        assert_eq!(
+            classify_login_response(&f),
+            Err(SdkLoginError::AuthFailed { auth_code: Some(5) })
+        );
+    }
+
+    #[test]
+    fn account_locked_and_username_invalid_abort() {
+        let locked = classify_login_response(&frame([0x01, 0x04], [0, 0, 0, 0])).unwrap_err();
+        assert_eq!(locked, SdkLoginError::AccountLocked);
+        assert!(locked.should_abort());
+
+        let bad_user = classify_login_response(&frame([0x01, 0x01], [0, 0, 0, 0])).unwrap_err();
+        assert_eq!(bad_user, SdkLoginError::UsernameInvalid);
+        assert!(bad_user.should_abort());
+    }
+
+    #[test]
+    fn auth_failed_aborts_only_when_attempts_low() {
+        let many = SdkLoginError::AuthFailed { auth_code: Some(9) };
+        assert!(!many.should_abort());
+        let few = SdkLoginError::AuthFailed { auth_code: Some(1) };
+        assert!(few.should_abort());
+    }
+
+    #[test]
+    fn short_frame_and_unknown_codes() {
+        assert_eq!(
+            classify_login_response(&[0u8; 4]),
+            Err(SdkLoginError::NoReply)
+        );
+        assert_eq!(
+            classify_login_response(&frame([0x03, 0x03], [0, 0, 0, 0])),
+            Err(SdkLoginError::Other(0x03, 0x03))
+        );
     }
 }

